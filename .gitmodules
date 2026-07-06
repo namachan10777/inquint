@@ -1,0 +1,3 @@
+[submodule "quint"]
+	path = quint
+	url = https://github.com/quint-co/quint.git
