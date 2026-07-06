@@ -1,0 +1,16 @@
+[package]
+name = "quintck-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for the quintck explicit-state model checker"
+
+[[bin]]
+name = "quintck"
+path = "src/main.rs"
+
+[dependencies]
+quint-ast = { path = "../quint-ast" }
+quintck = { path = "../quintck" }
+clap = { workspace = true }
+serde_json = { workspace = true }

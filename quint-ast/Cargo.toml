@@ -1,0 +1,12 @@
+[package]
+name = "quint-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Serde types for the Quint compiler's flattened JSON IR (`quint compile --target=json`)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }

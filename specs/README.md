@@ -38,7 +38,7 @@ shared Apalache server on port 8822 and can crash.
 | `TwoLayeredCache` | 2 keys, 3 writes | `cleanConsistency`, `dirtyInL1`; TLC: `verMonotone`, `eventuallyClean`; Apalache temporal: `verNeverDecreases` | `brokenL1Backed` (1), `brokenAlwaysProgress` (lasso), `brokenEventuallyCleanNoFairness` (lasso) |
 | `DiningPhilosophers` | 3 phils × {fixed, naive} | `consistent`; TLC (fixed): `noDeadlock`, `someoneEats` | `brokenNeverEating` (3), naive `noDeadlock` (deadlock at 6), `brokenSomeoneEatsNoFairness` (lasso) |
 | `ReliableBroadcast` | 3 procs, faulty sender | `validity`, `relayedBeforeDelivered` (+ inductive `IndInv`); TLC: `totality` | `brokenNobodyDelivers` (2), `brokenTotalityNoFairness` (lasso) |
-| `LamportMutex` | 2 procs, clock ≤ 3 | `mutex`, `requestConsistency` | `brokenNooneCritical` (6) |
+| `LamportMutex` | 2 procs, clock ≤ 3 | `mutex`, `requestConsistency` | `brokenNooneCritical` (4) |
 | `Paxos` | 3 acceptors, 2 values, 3 ballots | `agreement`, `oneValuePerBallot` | `brokenNothingChosen` (6) |
 | `Raft` | 3 servers (`raft_3` full, `raft_election` election-only) | `electionSafety`, `logMatching`, `voteIntegrity`; TLC: `termsMonotone`, `quorumCandidateProgress` | `brokenNoLeader` (3), `brokenAtMostOneCandidate` (2), `brokenEventuallyLeaderNoFairness` (lasso) |
 

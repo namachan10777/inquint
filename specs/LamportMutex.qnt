@@ -18,7 +18,7 @@
  *
  * Expected-violation:
  *   quint verify specs/LamportMutex.qnt --main=main \
- *     --invariant=brokenNooneCritical --max-steps=6    (depth 6)
+ *     --invariant=brokenNooneCritical --max-steps=6    (depth 4)
  */
 module lamport_mutex {
   const N: int
@@ -179,8 +179,9 @@ module lamport_mutex {
       chan.get((p, q)).select(isRequest).length() <= 1),
   }
 
-  /// The critical section is clearly reachable (fails at depth 6 with
-  /// N = 2: request, receive Request, receive Ack, enter — plus scheduling).
+  /// The critical section is clearly reachable (fails at depth 4 with
+  /// N = 2: request, receive Request, receive Ack, enter — the requester's
+  /// self-ack is recorded at request time).
   val brokenNooneCritical =
     Procs.forall(p => pc.get(p) != Critical)
 }

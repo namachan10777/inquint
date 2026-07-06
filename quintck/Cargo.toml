@@ -1,0 +1,14 @@
+[package]
+name = "quintck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Explicit-state (TLC-like) model checker core for Quint"
+
+[dependencies]
+quint-ast = { path = "../quint-ast" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+itf = { workspace = true }
