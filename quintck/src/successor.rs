@@ -24,7 +24,7 @@ pub struct SubActionRuns {
 impl SubActionRuns {
     /// Does the concrete edge (from, to) satisfy the action? True iff some
     /// run's assigned variables all agree with `to`.
-    pub fn matches(&self, to: &State) -> bool {
+    pub fn matches(&self, to: &[Value]) -> bool {
         self.partials.iter().any(|p| {
             p.iter()
                 .zip(to.iter())
@@ -37,13 +37,12 @@ impl SubActionRuns {
 
     /// The frame-filled successor for a partial run: unassigned = keep the
     /// source value. Used for ENABLED ⟨A⟩_v checks.
-    pub fn framed(&self, from: &State) -> impl Iterator<Item = State> + '_ {
-        let from = from.clone();
+    pub fn framed<'a>(&'a self, from: &'a [Value]) -> impl Iterator<Item = State> + 'a {
         self.partials.iter().map(move |p| {
             let values: Vec<Value> = p
                 .iter()
                 .zip(from.iter())
-                .map(|(assigned, cur)| assigned.clone().unwrap_or_else(|| cur.clone()))
+                .map(|(assigned, cur)| assigned.unwrap_or(*cur))
                 .collect();
             Rc::from(values.into_boxed_slice())
         })
@@ -59,7 +58,7 @@ impl SubActionRuns {
 pub fn enumerate_partial(
     action: &crate::eval::BoundExpr,
     storage: &Rc<RefCell<VarStorage>>,
-    from: &State,
+    from: &[Value],
 ) -> Result<SubActionRuns, QuintError> {
     let saved = action.set_bindings();
     let result = enumerate_partial_inner(action, storage, from);
@@ -70,7 +69,7 @@ pub fn enumerate_partial(
 fn enumerate_partial_inner(
     action: &crate::eval::BoundExpr,
     storage: &Rc<RefCell<VarStorage>>,
-    from: &State,
+    from: &[Value],
 ) -> Result<SubActionRuns, QuintError> {
     storage.borrow().load(from);
 
@@ -101,19 +100,20 @@ fn enumerate_partial_inner(
 }
 
 /// Enumerate all distinct successor states of `from` under `action`
-/// (or all initial states when `from` is `None`).
+/// (or all initial states when `from` is `None`). The result is sorted
+/// (by id) and deduplicated.
 pub fn enumerate(
     action: &CompiledExpr,
     storage: &Rc<RefCell<VarStorage>>,
-    from: Option<&State>,
-) -> Result<BTreeSet<State>, QuintError> {
+    from: Option<&[Value]>,
+) -> Result<Vec<State>, QuintError> {
     match from {
         Some(state) => storage.borrow().load(state),
         None => storage.borrow().clear_current(),
     }
 
     let ctl = Rc::new(RefCell::new(ChoiceCtl::new()));
-    let mut out = BTreeSet::new();
+    let mut out: Vec<State> = Vec::new();
     let mut runs: u64 = 0;
 
     loop {
@@ -132,12 +132,14 @@ pub fn enumerate(
         let mut env = Env::new(storage.clone(), Some(ctl.clone()));
         let enabled = action.execute(&mut env)?;
         if enabled.as_bool() {
-            out.insert(storage.borrow().take_next_state()?);
+            out.push(storage.borrow().take_next_state()?);
         }
         if !ctl.borrow_mut().advance() {
             break;
         }
     }
 
+    out.sort_unstable();
+    out.dedup();
     Ok(out)
 }

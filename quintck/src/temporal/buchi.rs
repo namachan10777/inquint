@@ -328,7 +328,7 @@ mod tests {
                 continue;
             }
             let members: Vec<usize> = (0..np)
-                .filter(|&j| j == i || (path[i][*&j] && path[j][i]))
+                .filter(|&j| j == i || (path[i][j] && path[j][i]))
                 .collect();
             let all_acc = gba.acc_sets.iter().all(|f| {
                 members.iter().any(|&m| f[pnodes[m].1])

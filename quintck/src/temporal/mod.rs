@@ -85,7 +85,7 @@ pub fn check_temporal(
                 safety::SafetyOutcome::Pass => continue,
                 safety::SafetyOutcome::Violation { trace } => {
                     return Ok(TemporalOutcome::SafetyViolation {
-                        property: prop.name.clone(),
+                        property: prop.name,
                         trace,
                     })
                 }
@@ -97,7 +97,7 @@ pub fn check_temporal(
             None => continue,
             Some(lasso) => {
                 return Ok(TemporalOutcome::Violation {
-                    property: prop.name.clone(),
+                    property: prop.name,
                     lasso,
                 })
             }
@@ -105,7 +105,7 @@ pub fn check_temporal(
     }
 
     Ok(TemporalOutcome::Pass {
-        states: g.states.len() as u64,
+        states: g.len() as u64,
     })
 }
 
@@ -133,16 +133,15 @@ fn check_liveness(
 /// atom valuations. Requires mapping lasso states back to graph ids and
 /// consecutive pairs to CSR edges.
 fn lasso_satisfies_negation(body: &ltl::Ltl, lasso: &Lasso, g: &graph::StateGraph) -> bool {
+    use crate::value::Value;
     use rustc_hash::FxHashMap;
-    let index: FxHashMap<&State, u32> = g
-        .states
-        .iter()
-        .zip(0u32..)
+    let index: FxHashMap<&[Value], u32> = (0..g.len() as u32)
+        .map(|i| (g.state(i), i))
         .collect();
     let ids: Vec<u32> = lasso
         .states
         .iter()
-        .map(|s| *index.get(s).expect("lasso state in graph"))
+        .map(|s| *index.get(&s[..]).expect("lasso state in graph"))
         .collect();
     let n = ids.len();
     let succ_of = |i: usize| if i + 1 < n { i + 1 } else { lasso.loop_index };

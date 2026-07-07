@@ -68,7 +68,7 @@ fn teaching_concurrency_successor_counts() {
     let initial = enumerate(&spec.init, &spec.storage, None).unwrap();
     assert_eq!(initial.len(), 27);
 
-    let some_init = initial.iter().next().unwrap();
+    let some_init = initial.first().unwrap();
     let successors = enumerate(&spec.step, &spec.storage, Some(some_init)).unwrap();
     // 3 processes can each take a step; results are distinct states
     assert_eq!(successors.len(), 3);
@@ -79,7 +79,7 @@ fn teaching_concurrency_successor_counts() {
 fn enumeration_is_deterministic() {
     let spec = build("TwoPhaseCommit.json", &["consistency"]);
     let initial = enumerate(&spec.init, &spec.storage, None).unwrap();
-    let s = initial.iter().next().unwrap();
+    let s = initial.first().unwrap();
     let a = enumerate(&spec.step, &spec.storage, Some(s)).unwrap();
     let b = enumerate(&spec.step, &spec.storage, Some(s)).unwrap();
     assert_eq!(a, b);

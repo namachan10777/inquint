@@ -1,23 +1,17 @@
-//! The evaluator: closure compilation of Quint IR expressions.
+//! The evaluation runtime shared surface: the environment, compiled
+//! expressions (bytecode functions of the [`crate::vm`] engine), and
+//! quantifier-bound expressions used by the temporal layer.
 //!
-//! Architecture follows the reference `quint_evaluator` (compile each
-//! expression once into an `Rc<dyn Fn>` graph; name references resolve at
-//! compile time to shared registers), with two deliberate differences:
-//! - nondeterminism (`any`, `nondet`/`oneOf`) goes through the
-//!   [`crate::choice::ChoiceCtl`] oracle instead of a RNG, so successors can
-//!   be enumerated exhaustively;
-//! - no instance/namespace machinery: the input module is flattened.
+//! Nondeterminism (`any`, `nondet`/`oneOf`) goes through the
+//! [`crate::choice::ChoiceCtl`] oracle instead of a RNG, so successors can
+//! be enumerated exhaustively.
 
 pub mod builtins_eager;
-pub mod builtins_lazy;
-pub mod compile;
-
-pub use compile::Compiler;
 
 use crate::choice::ChoiceCtl;
 use crate::error::QuintError;
-use crate::state::VarStorage;
-use crate::value::{EvalResult, Value, ValueInner};
+use crate::state::{Register, VarStorage};
+use crate::value::{EvalResult, Value};
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -69,22 +63,24 @@ impl Env {
     }
 }
 
+/// A compiled expression: a bytecode function of a shared [`crate::vm::Vm`].
+/// `execute` is a top-level entry only — VM execution never re-enters
+/// through `CompiledExpr` (internal calls go through `FnId` directly).
 #[derive(Clone)]
-pub struct CompiledExpr(Rc<dyn Fn(&mut Env) -> EvalResult>);
+pub struct CompiledExpr {
+    pub vm: Rc<RefCell<crate::vm::Vm>>,
+    pub fnid: crate::vm::FnId,
+}
 
 impl CompiledExpr {
-    pub fn new(f: impl Fn(&mut Env) -> EvalResult + 'static) -> Self {
-        CompiledExpr(Rc::new(f))
-    }
-
     pub fn execute(&self, env: &mut Env) -> EvalResult {
-        self.0(env)
+        self.vm.borrow_mut().run(env, self.fnid)
     }
 }
 
 impl fmt::Debug for CompiledExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<compiled>")
+        write!(f, "<fn {}>", self.fnid)
     }
 }
 
@@ -94,7 +90,7 @@ impl fmt::Debug for CompiledExpr {
 #[derive(Clone)]
 pub struct BoundExpr {
     pub expr: CompiledExpr,
-    pub bindings: Vec<(Rc<RefCell<Option<Value>>>, Value)>,
+    pub bindings: Vec<(Register, Value)>,
 }
 
 impl BoundExpr {
@@ -109,32 +105,13 @@ impl BoundExpr {
     pub fn set_bindings(&self) -> Vec<Option<Value>> {
         self.bindings
             .iter()
-            .map(|(reg, value)| reg.replace(Some(value.clone())))
+            .map(|(reg, value)| reg.replace(Some(*value)))
             .collect()
     }
 
     pub fn restore_bindings(&self, saved: Vec<Option<Value>>) {
         for ((reg, _), old) in self.bindings.iter().zip(saved) {
-            *reg.borrow_mut() = old;
+            reg.set(old);
         }
     }
-}
-
-/// Apply a lambda value to arguments, saving and restoring the parameter
-/// registers so that shadowing and reentrant calls are correct.
-pub fn apply_lambda(lambda: &Value, env: &mut Env, args: Vec<Value>) -> EvalResult {
-    let (registers, body) = match lambda.0.as_ref() {
-        ValueInner::Lambda(registers, body) => (registers, body),
-        v => panic!("expected lambda, got {v:?}"),
-    };
-    debug_assert_eq!(registers.len(), args.len());
-    let saved: Vec<Option<Value>> = registers.iter().map(|r| r.borrow().clone()).collect();
-    for (register, arg) in registers.iter().zip(args) {
-        *register.borrow_mut() = Some(arg);
-    }
-    let result = body.execute(env);
-    for (register, old) in registers.iter().zip(saved) {
-        *register.borrow_mut() = old;
-    }
-    result
 }

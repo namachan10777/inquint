@@ -8,18 +8,18 @@
 
 use super::ltl::{EdgeAtomId, Ltl, StateAtomId};
 use crate::error::QuintError;
-use crate::eval::{BoundExpr, Compiler, Env};
+use crate::eval::{BoundExpr, Env};
+use crate::state::Register;
+use crate::vm::Lowerer;
 use crate::value::Value;
 use quint_ast::{Declaration, LookupDefinition, LookupTable, QuintEx, QuintId, QuintName};
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 pub type ActionId = u32;
 pub type VarsId = u32;
 
-type Binding = (QuintId, Rc<RefCell<Option<Value>>>, Value);
+type Binding = (QuintId, Register, Value);
 
 pub enum StateAtom {
     /// A plain state predicate.
@@ -85,7 +85,7 @@ enum EAtomKey {
 }
 
 pub struct Parser<'c, 't> {
-    compiler: &'c mut Compiler<'t>,
+    compiler: &'c mut Lowerer<'t>,
     table: &'t LookupTable,
     pub atoms: AtomTable,
     /// Current quantifier bindings: (param id, register, value).
@@ -120,7 +120,7 @@ fn err(msg: impl Into<String>) -> QuintError {
 }
 
 impl<'c, 't> Parser<'c, 't> {
-    pub fn new(compiler: &'c mut Compiler<'t>, table: &'t LookupTable) -> Self {
+    pub fn new(compiler: &'c mut Lowerer<'t>, table: &'t LookupTable) -> Self {
         Parser {
             compiler,
             table,
@@ -490,7 +490,7 @@ impl<'c, 't> Parser<'c, 't> {
     // ---------------------------------------------------------------
 
     fn bound_values(&self) -> Vec<Value> {
-        self.bindings.iter().map(|(_, _, v)| v.clone()).collect()
+        self.bindings.iter().map(|(_, _, v)| *v).collect()
     }
 
     fn bound_expr(&mut self, expr: &QuintEx) -> BoundExpr {
@@ -500,7 +500,7 @@ impl<'c, 't> Parser<'c, 't> {
             bindings: self
                 .bindings
                 .iter()
-                .map(|(_, reg, v)| (reg.clone(), v.clone()))
+                .map(|(_, reg, v)| (reg.clone(), *v))
                 .collect(),
         }
     }
@@ -579,11 +579,12 @@ impl<'c, 't> Parser<'c, 't> {
             bindings: self
                 .bindings
                 .iter()
-                .map(|(_, reg, v)| (reg.clone(), v.clone()))
+                .map(|(_, reg, v)| (reg.clone(), *v))
                 .collect(),
         };
-        self.compiler.storage.borrow().clear_current();
-        let mut env = Env::new(self.compiler.storage.clone(), None);
+        let storage = self.compiler.storage();
+        storage.borrow().clear_current();
+        let mut env = Env::new(storage, None);
         be.eval(&mut env).map_err(|e| {
             if e.code == "QNT502" {
                 err("temporal quantification over a state-dependent set is not supported")

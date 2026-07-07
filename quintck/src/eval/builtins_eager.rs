@@ -1,12 +1,17 @@
-//! Eager builtin operators: arguments are evaluated before application.
-//! Semantics and error codes ported from the reference `builtins.rs`.
+//! First-order eager builtin operators: arguments are evaluated before
+//! application. Semantics and error codes ported from the reference
+//! `builtins.rs`. Higher-order builtins (fold/map/filter/...) live in
+//! `vm::builtins`, which dispatches here for everything first-order.
+//!
+//! Values are interned ids: container updates copy flat id slices (memcpy)
+//! and re-intern; equality is an id compare; membership is a binary search
+//! over the canonical sorted order.
 
-use super::{apply_lambda, Env};
+use super::Env;
 use crate::error::{unsupported, QuintError};
-use crate::value::{value_eq, EvalResult, Value, ValueInner};
-use std::collections::BTreeMap;
+use crate::value::{value_cmp, value_eq, EvalResult, Value};
 
-pub type EagerFn = fn(&mut Env, Vec<Value>) -> EvalResult;
+pub type EagerFn = fn(&mut Env, &[Value]) -> EvalResult;
 
 fn at_index(list: &[Value], index: i64) -> EvalResult {
     if index < 0 || index as usize >= list.len() {
@@ -15,7 +20,7 @@ fn at_index(list: &[Value], index: i64) -> EvalResult {
             format!("Out of bounds, nth({index})"),
         ));
     }
-    Ok(list[index as usize].clone())
+    Ok(list[index as usize])
 }
 
 fn checked(op: &str, a: i64, b: i64, r: Option<i64>) -> EvalResult {
@@ -31,26 +36,21 @@ fn checked(op: &str, a: i64, b: i64, r: Option<i64>) -> EvalResult {
 /// Returns None for unknown opcodes (then it must be a user-defined op).
 pub fn eager_op(op: &str) -> Option<EagerFn> {
     Some(match op {
-        "Set" => |_, args| Value::set(args),
+        "Set" => |_, args| Value::set(args.iter().copied()),
         "Rec" => |_, args| {
             Value::record(
                 args.chunks_exact(2)
-                    .map(|kv| (kv[0].as_str().clone(), kv[1].clone())),
+                    .map(|kv| (kv[0].as_str(), kv[1])),
             )
         },
-        "Tup" => |_, args| Value::tuple(args),
-        "List" => |_, args| Value::list(args),
-        "Map" => |_, args| {
-            Value::map(args.iter().map(|kv| {
-                let (k, v) = kv.as_tuple2();
-                (k.clone(), v.clone())
-            }))
-        },
-        "variant" => |_, args| Value::variant(args[0].as_str().clone(), args[1].clone()),
+        "Tup" => |_, args| Value::tuple(args.iter().copied()),
+        "List" => |_, args| Value::list(args.iter().copied()),
+        "Map" => |_, args| Value::map(args.iter().map(|kv| kv.as_tuple2())),
+        "variant" => |_, args| Value::variant(args[0].as_str(), args[1]),
         "not" => |_, args| Ok(Value::bool(!args[0].as_bool())),
         "iff" => |_, args| Ok(Value::bool(args[0].as_bool() == args[1].as_bool())),
-        "eq" => |_, args| Ok(Value::bool(value_eq(&args[0], &args[1])?)),
-        "neq" => |_, args| Ok(Value::bool(!value_eq(&args[0], &args[1])?)),
+        "eq" => |_, args| Ok(Value::bool(value_eq(args[0], args[1])?)),
+        "neq" => |_, args| Ok(Value::bool(!value_eq(args[0], args[1])?)),
         "iadd" => |_, args| {
             let (a, b) = (args[0].as_int(), args[1].as_int());
             checked("+", a, b, a.checked_add(b))
@@ -95,14 +95,14 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
         "igte" => |_, args| Ok(Value::bool(args[0].as_int() >= args[1].as_int())),
         // Tuples are 1-indexed (_1, _2, ...)
         "item" => |_, args| at_index(args[0].as_elems(), args[1].as_int() - 1),
-        "tuples" => |_, args| Ok(Value::cross_product(args)),
+        "tuples" => |_, args| Ok(Value::cross_product(args.to_vec())),
         "range" => |_, args| {
             let (start, end) = (args[0].as_int(), args[1].as_int());
-            Value::list((start..end).map(Value::int))
+            Ok(Value::list_of_normalized((start..end).map(Value::int).collect()))
         },
         "nth" => |_, args| at_index(args[0].as_elems(), args[1].as_int()),
         "replaceAt" => |_, args| {
-            let mut list = args[0].as_elems().clone();
+            let list = args[0].as_elems();
             let index = args[1].as_int();
             if index < 0 || index as usize >= list.len() {
                 return Err(QuintError::new(
@@ -110,11 +110,12 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
                     format!("Out of bounds, replaceAt({index})"),
                 ));
             }
-            list[index as usize] = args[2].clone().normalize()?;
-            Value::list(list)
+            let mut out = list.to_vec();
+            out[index as usize] = args[2].normalize()?;
+            Ok(Value::list_of_normalized(out))
         },
         "head" => |_, args| match args[0].as_elems().first() {
-            Some(h) => Ok(h.clone()),
+            Some(h) => Ok(*h),
             None => Err(QuintError::new("QNT505", "Called 'head' on an empty list")),
         },
         "tail" => |_, args| {
@@ -122,14 +123,16 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             if list.is_empty() {
                 Err(QuintError::new("QNT505", "Called 'tail' on an empty list"))
             } else {
-                Value::list(list[1..].iter().cloned())
+                Ok(Value::list_of_normalized(list[1..].to_vec()))
             }
         },
         "slice" => |_, args| {
             let list = args[0].as_elems();
             let (start, end) = (args[1].as_int(), args[2].as_int());
             if start >= 0 && end >= start && (end as usize) <= list.len() {
-                Value::list(list[start as usize..end as usize].iter().cloned())
+                Ok(Value::list_of_normalized(
+                    list[start as usize..end as usize].to_vec(),
+                ))
             } else {
                 Err(QuintError::new(
                     "QNT506",
@@ -142,14 +145,18 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
         },
         "length" => |_, args| int_from_card(args[0].cardinality()?),
         "append" => |_, args| {
-            let mut list = args[0].as_elems().clone();
-            list.push(args[1].clone().normalize()?);
-            Value::list(list)
+            let list = args[0].as_elems();
+            let mut out = Vec::with_capacity(list.len() + 1);
+            out.extend_from_slice(list);
+            out.push(args[1].normalize()?);
+            Ok(Value::list_of_normalized(out))
         },
         "concat" => |_, args| {
-            let mut list = args[0].as_elems().clone();
-            list.extend(args[1].as_elems().iter().cloned());
-            Value::list(list)
+            let (a, b) = (args[0].as_elems(), args[1].as_elems());
+            let mut out = Vec::with_capacity(a.len() + b.len());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            Ok(Value::list_of_normalized(out))
         },
         "indices" => |_, args| {
             let size = i64::try_from(args[0].cardinality()?)
@@ -158,41 +165,54 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
         },
         "field" => |_, args| {
             Ok(args[0]
-                .as_record()
-                .get(args[1].as_str())
-                .expect("field: no such field (type checker bug?)")
-                .clone())
+                .record_field(args[1].as_str())
+                .expect("field: no such field (type checker bug?)"))
         },
         "fieldNames" => |_, args| {
-            Value::set(args[0].as_record().keys().map(|k| Value::str(k.clone())))
+            let (shape, _) = args[0].as_record();
+            Value::set(shape.fields.iter().map(|k| Value::str(*k)))
         },
         "with" => |_, args| {
-            let mut record = args[0].as_record().clone();
-            record.insert(args[1].as_str().clone(), args[2].clone().normalize()?);
-            Ok(Value(std::rc::Rc::new(ValueInner::Record(record))))
+            let (shape, values) = args[0].as_record();
+            let field = args[1].as_str();
+            let i = shape
+                .fields
+                .iter()
+                .position(|&f| f == field)
+                .expect("with: no such field (type checker bug?)");
+            let mut out: Box<[Value]> = values.into();
+            out[i] = args[2].normalize()?;
+            Ok(Value::record_shaped(shape, out))
         },
-        "powerset" => |_, args| Ok(Value::power_set(args[0].clone())),
-        "contains" => |_, args| Ok(Value::bool(args[0].contains(&args[1].normalize()?)?)),
-        "in" => |_, args| Ok(Value::bool(args[1].contains(&args[0].normalize()?)?)),
-        "subseteq" => |_, args| Ok(Value::bool(args[0].subseteq(&args[1])?)),
+        "powerset" => |_, args| Ok(Value::power_set(args[0])),
+        "contains" => |_, args| Ok(Value::bool(args[0].contains(args[1].normalize()?)?)),
+        "in" => |_, args| Ok(Value::bool(args[1].contains(args[0].normalize()?)?)),
+        "subseteq" => |_, args| Ok(Value::bool(args[0].subseteq(args[1])?)),
         "exclude" => |_, args| {
-            let a = args[0].enumerate()?.into_owned();
-            let b = args[1].enumerate()?;
-            Ok(Value::set_normalized(
-                a.into_iter().filter(|v| !b.contains(v)).collect(),
-            ))
+            let a = args[0].enumerate()?;
+            let mut out = Vec::new();
+            for v in a.iter() {
+                if !args[1].contains(*v)? {
+                    out.push(*v);
+                }
+            }
+            // filtering a sorted slice keeps it sorted
+            Ok(Value::set_sorted(out))
         },
         "union" => |_, args| {
-            let mut a = args[0].enumerate()?.into_owned();
-            a.extend(args[1].enumerate()?.iter().cloned());
-            Ok(Value::set_normalized(a))
+            let a = args[0].enumerate()?;
+            let b = args[1].enumerate()?;
+            Ok(Value::set_sorted(merge_sorted(&a, &b)))
         },
         "intersect" => |_, args| {
-            let a = args[0].enumerate()?.into_owned();
-            let b = args[1].enumerate()?;
-            Ok(Value::set_normalized(
-                a.into_iter().filter(|v| b.contains(v)).collect(),
-            ))
+            let a = args[0].enumerate()?;
+            let mut out = Vec::new();
+            for v in a.iter() {
+                if args[1].contains(*v)? {
+                    out.push(*v);
+                }
+            }
+            Ok(Value::set_sorted(out))
         },
         "size" => |_, args| int_from_card(args[0].cardinality()?),
         // Only finite sets are supported, so this is constant.
@@ -206,46 +226,25 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
                 Ok(Value::interval(start, end))
             }
         },
-        "fold" => |env, args| {
-            let set = args[0].enumerate()?.into_owned();
-            let mut acc = args[1].clone();
-            for v in set {
-                acc = apply_lambda(&args[2], env, vec![acc, v])?;
-            }
-            Ok(acc)
-        },
-        "foldl" => |env, args| {
-            let mut acc = args[1].clone();
-            for v in args[0].as_elems().clone() {
-                acc = apply_lambda(&args[2], env, vec![acc, v])?;
-            }
-            Ok(acc)
-        },
-        "foldr" => |env, args| {
-            let mut acc = args[1].clone();
-            for v in args[0].as_elems().clone().into_iter().rev() {
-                acc = apply_lambda(&args[2], env, vec![v, acc])?;
-            }
-            Ok(acc)
-        },
         "flatten" => |_, args| {
-            let outer = args[0].enumerate()?.into_owned();
-            let mut result = std::collections::BTreeSet::new();
-            for inner in outer {
-                result.extend(inner.enumerate()?.iter().cloned());
+            let outer = args[0].enumerate()?;
+            let mut result = Vec::new();
+            for inner in outer.iter() {
+                result.extend_from_slice(&inner.enumerate()?);
             }
-            Ok(Value::set_normalized(result))
+            Ok(Value::set_of_normalized(result))
         },
         "get" => |_, args| {
-            let map = args[0].as_map();
             let key = args[1].normalize()?;
-            map.get(&key).cloned().ok_or_else(|| {
+            args[0].map_get(key).ok_or_else(|| {
                 QuintError::new(
                     "QNT507",
                     format!(
                         "Called 'get' with a non-existing key. Key is {key}. Map has keys: {}",
-                        map.keys()
-                            .map(|k| k.to_string())
+                        args[0]
+                            .as_map()
+                            .iter()
+                            .map(|(k, _)| k.to_string())
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
@@ -253,97 +252,41 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             })
         },
         "set" => |_, args| {
-            let mut map = args[0].as_map().clone();
+            let entries = args[0].as_map();
             let key = args[1].normalize()?;
-            if !map.contains_key(&key) {
-                return Err(QuintError::new(
+            match entries.binary_search_by(|(k, _)| value_cmp(*k, key)) {
+                Ok(i) => {
+                    let mut out = entries.to_vec();
+                    out[i].1 = args[2].normalize()?;
+                    Ok(Value::map_sorted(out))
+                }
+                Err(_) => Err(QuintError::new(
                     "QNT507",
                     "Called 'set' with a non-existing key",
-                ));
-            }
-            map.insert(key, args[2].clone().normalize()?);
-            Ok(Value::map_normalized(map))
-        },
-        "put" => |_, args| {
-            let mut map = args[0].as_map().clone();
-            map.insert(args[1].normalize()?, args[2].clone().normalize()?);
-            Ok(Value::map_normalized(map))
-        },
-        "setBy" => |env, args| {
-            let mut map = args[0].as_map().clone();
-            let key = args[1].normalize()?;
-            match map.get(&key).cloned() {
-                Some(old) => {
-                    let new = apply_lambda(&args[2], env, vec![old])?.normalize()?;
-                    map.insert(key, new);
-                    Ok(Value::map_normalized(map))
-                }
-                None => Err(QuintError::new(
-                    "QNT507",
-                    format!("Called 'setBy' with a non-existing key {key}"),
                 )),
             }
         },
-        "keys" => |_, args| Ok(Value::set_normalized(args[0].as_map().keys().cloned().collect())),
-        "exists" => |env, args| {
-            for v in args[0].enumerate()?.into_owned() {
-                if apply_lambda(&args[1], env, vec![v])?.as_bool() {
-                    return Ok(Value::bool(true));
-                }
+        "put" => |_, args| {
+            let entries = args[0].as_map();
+            let key = args[1].normalize()?;
+            let value = args[2].normalize()?;
+            let mut out = entries.to_vec();
+            match out.binary_search_by(|(k, _)| value_cmp(*k, key)) {
+                Ok(i) => out[i].1 = value,
+                Err(i) => out.insert(i, (key, value)),
             }
-            Ok(Value::bool(false))
+            Ok(Value::map_sorted(out))
         },
-        "forall" => |env, args| {
-            for v in args[0].enumerate()?.into_owned() {
-                if !apply_lambda(&args[1], env, vec![v])?.as_bool() {
-                    return Ok(Value::bool(false));
-                }
-            }
-            Ok(Value::bool(true))
-        },
-        "map" => |env, args| {
-            let set = args[0].enumerate()?.into_owned();
-            let mut out = std::collections::BTreeSet::new();
-            for v in set {
-                out.insert(apply_lambda(&args[1], env, vec![v])?.normalize()?);
-            }
-            Ok(Value::set_normalized(out))
-        },
-        "filter" => |env, args| {
-            let set = args[0].enumerate()?.into_owned();
-            let mut out = std::collections::BTreeSet::new();
-            for v in set {
-                if apply_lambda(&args[1], env, vec![v.clone()])?.as_bool() {
-                    out.insert(v);
-                }
-            }
-            Ok(Value::set_normalized(out))
-        },
-        "select" => |env, args| {
-            let mut out = Vec::new();
-            for v in args[0].as_elems().clone() {
-                if apply_lambda(&args[1], env, vec![v.clone()])?.as_bool() {
-                    out.push(v);
-                }
-            }
-            Value::list(out)
-        },
-        "mapBy" => |env, args| {
-            let keys = args[0].enumerate()?.into_owned();
-            let mut out = BTreeMap::new();
-            for k in keys {
-                let v = apply_lambda(&args[1], env, vec![k.clone()])?.normalize()?;
-                out.insert(k, v);
-            }
-            Ok(Value::map_normalized(out))
+        "keys" => |_, args| {
+            // map keys are sorted by value_cmp already
+            Ok(Value::set_sorted(
+                args[0].as_map().iter().map(|(k, _)| *k).collect(),
+            ))
         },
         "setToMap" => |_, args| {
-            Value::map(args[0].enumerate()?.iter().map(|kv| {
-                let (k, v) = kv.as_tuple2();
-                (k.clone(), v.clone())
-            }))
+            Value::map(args[0].enumerate()?.iter().map(|kv| kv.as_tuple2()))
         },
-        "setOfMaps" => |_, args| Ok(Value::map_set(args[0].clone(), args[1].clone())),
+        "setOfMaps" => |_, args| Ok(Value::map_set(args[0], args[1])),
         "fail" => |_, args| Ok(Value::bool(!args[0].as_bool())),
         "assert" => |_, args| {
             if !args[0].as_bool() {
@@ -363,15 +306,15 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
                     ),
                 ));
             }
-            Ok(set.iter().next().cloned().unwrap())
+            Ok(set[0])
         },
         "q::debug" => |_, args| {
             eprintln!("> {} {}", args[0].as_str(), args[1]);
-            Ok(args[1].clone())
+            Ok(args[1])
         },
         // All lists over a set with length <= n.
         "allListsUpTo" => |_, args| {
-            let elems: Vec<Value> = args[0].enumerate()?.iter().cloned().collect();
+            let elems = args[0].enumerate()?;
             let max_len = args[1].as_int().max(0) as u32;
             let count = (elems.len() as u64)
                 .checked_pow(max_len)
@@ -383,9 +326,9 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             for _ in 0..max_len {
                 let mut next_frontier = Vec::new();
                 for list in &frontier {
-                    for e in &elems {
+                    for e in elems.iter() {
                         let mut l = list.clone();
-                        l.push(e.clone());
+                        l.push(*e);
                         next_frontier.push(l);
                     }
                 }
@@ -395,17 +338,16 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             Value::set(
                 lists
                     .into_iter()
-                    .map(Value::list)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .map(Value::list_of_normalized)
+                    .collect::<Vec<_>>(),
             )
         },
-        // Deterministic pick: the canonical (BTree-least) element.
+        // Deterministic pick: the canonical (structurally least) element.
         "chooseSome" => |_, args| {
             args[0]
                 .enumerate()?
-                .iter()
-                .next()
-                .cloned()
+                .first()
+                .copied()
                 .ok_or_else(|| QuintError::new("QNT505", "Called 'chooseSome' on an empty set"))
         },
         "allLists" | "always" | "eventually" | "enabled" | "orKeep" | "mustChange"
@@ -414,6 +356,32 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
         }
         _ => return None,
     })
+}
+
+/// Merge two value_cmp-sorted dedup'd slices into one (set union).
+fn merge_sorted(a: &[Value], b: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match value_cmp(a[i], b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
 }
 
 fn int_from_card(card: u64) -> EvalResult {

@@ -3,30 +3,32 @@
 //! See https://apalache-mc.org/docs/adr/015adr-trace.html
 
 use crate::state::State;
-use crate::value::{Value, ValueInner};
+use crate::value::{Value, ValueData};
 use quint_ast::QuintName;
 use std::collections::BTreeMap;
 
 impl Value {
-    pub fn to_itf(&self) -> itf::Value {
-        match self.0.as_ref() {
-            ValueInner::Int(i) => itf::Value::Number(*i),
-            ValueInner::Bool(b) => itf::Value::Bool(*b),
-            ValueInner::Str(s) => itf::Value::String(s.to_string()),
-            ValueInner::Set(s) => itf::Value::Set(s.iter().map(|v| v.to_itf()).collect()),
-            ValueInner::Tuple(vs) => itf::Value::Tuple(vs.iter().map(|v| v.to_itf()).collect()),
-            ValueInner::List(vs) => itf::Value::List(vs.iter().map(|v| v.to_itf()).collect()),
-            ValueInner::Record(fields) => itf::Value::Record(
-                fields
+    pub fn to_itf(self) -> itf::Value {
+        match self.data() {
+            ValueData::Int(i) => itf::Value::Number(*i),
+            ValueData::Bool(b) => itf::Value::Bool(*b),
+            ValueData::Str(s) => itf::Value::String(s.to_string()),
+            ValueData::Set(s) => itf::Value::Set(s.iter().map(|v| v.to_itf()).collect()),
+            ValueData::Tuple(vs) => itf::Value::Tuple(vs.iter().map(|v| v.to_itf()).collect()),
+            ValueData::List(vs) => itf::Value::List(vs.iter().map(|v| v.to_itf()).collect()),
+            ValueData::Record(shape, values) => itf::Value::Record(
+                shape
+                    .fields
                     .iter()
+                    .zip(values.iter())
                     .map(|(k, v)| (k.to_string(), v.to_itf()))
                     .collect(),
             ),
-            ValueInner::Map(m) => {
+            ValueData::Map(m) => {
                 itf::Value::Map(m.iter().map(|(k, v)| (k.to_itf(), v.to_itf())).collect())
             }
             // Variants are encoded as { tag, value } records, like quint does.
-            ValueInner::Variant(label, payload) => itf::Value::Record(
+            ValueData::Variant(label, payload) => itf::Value::Record(
                 [
                     ("tag".to_string(), itf::Value::String(label.to_string())),
                     ("value".to_string(), payload.to_itf()),

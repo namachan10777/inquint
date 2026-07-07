@@ -1,11 +1,12 @@
 //! IR node types, mirroring the shapes in quint's `src/ir/quintIr.ts`.
 
+use crate::symbol::Symbol;
 use serde::Deserialize;
-use std::sync::Arc;
 
 pub type QuintId = u64;
-/// Interned-ish name: cheap to clone, hashable.
-pub type QuintName = Arc<str>;
+/// Interned name: `Copy`, equality/hash are a `u32` compare, `Ord` is
+/// string order (see [`Symbol`]).
+pub type QuintName = Symbol;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "kind")]

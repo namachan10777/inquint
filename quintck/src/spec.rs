@@ -1,8 +1,9 @@
 //! Entry-point resolution and compilation of a checkable spec.
 
-use crate::eval::{CompiledExpr, Compiler, Env};
-use crate::state::{State, VarStorage, VarTable};
-use crate::value::EvalResult;
+use crate::eval::{CompiledExpr, Env};
+use crate::state::{VarStorage, VarTable};
+use crate::value::{EvalResult, Value};
+use crate::vm::Lowerer;
 use quint_ast::{CompiledOutput, Declaration, OpDef, OpQualifier, QuintName};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -94,7 +95,7 @@ impl CompiledSpec {
         let mut invariant_defs: Vec<(QuintName, &OpDef)> = Vec::new();
         if entry.invariants.is_empty() {
             if let Some(inv) = find_def(module, "q::inv") {
-                invariant_defs.push((inv.name.clone(), inv));
+                invariant_defs.push((inv.name, inv));
             }
         } else {
             for name in &entry.invariants {
@@ -118,7 +119,7 @@ impl CompiledSpec {
             temporal_defs.push((QuintName::from(name.as_str()), def));
         }
 
-        let mut compiler = Compiler::new(&out.table, &vars);
+        let mut compiler = Lowerer::new(&out.table, &vars);
         let init = compiler.compile(&init_def.expr);
         let step = compiler.compile(&step_def.expr);
         let invariants = invariant_defs
@@ -130,12 +131,12 @@ impl CompiledSpec {
         let mut temporal = Vec::new();
         for (name, def) in temporal_defs {
             let prop = parser
-                .parse_property(name.clone(), &def.expr)
+                .parse_property(name, &def.expr)
                 .map_err(|e| BuildError::Temporal(format!("{name}: {e}")))?;
             temporal.push(prop);
         }
         let atoms = parser.atoms;
-        let storage = compiler.storage.clone();
+        let storage = compiler.storage();
 
         Ok(CompiledSpec {
             vars,
@@ -149,7 +150,7 @@ impl CompiledSpec {
     }
 
     /// Evaluate one invariant against a state (no nondeterminism allowed).
-    pub fn eval_invariant_at(&self, state: &State, inv: &CompiledExpr) -> EvalResult {
+    pub fn eval_invariant_at(&self, state: &[Value], inv: &CompiledExpr) -> EvalResult {
         self.storage.borrow().load(state);
         let mut env = Env::new(self.storage.clone(), None);
         inv.execute(&mut env)

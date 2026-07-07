@@ -7,10 +7,12 @@
 
 pub mod ir;
 pub mod output;
+pub mod symbol;
 pub mod table;
 
 pub use ir::{
     Declaration, LambdaParam, OpDef, OpQualifier, QuintEx, QuintId, QuintModule, QuintName,
 };
 pub use output::{CompiledOutput, LoadError};
+pub use symbol::Symbol;
 pub use table::{LookupDefinition, LookupTable};

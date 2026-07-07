@@ -96,6 +96,28 @@ Apalache/TLC handle in reasonable time and are checked by quintck only.
   agreeing; the two TLA forms TLC cannot parse are covered natively).
 - `bash quintck-bench.sh` — the ~1-minute-per-spec performance suite.
 
-Single-threaded BFS with full states as seen-set keys; fingerprinting,
-structural sharing, and parallel exploration are the planned optimization
-path.
+## Architecture (v2)
+
+Single-threaded BFS over hash-consed values on a bytecode VM:
+
+- **Interned symbols and values** (`quint-ast::Symbol`, `quintck::value`):
+  every runtime value is a `Copy` 32-bit id in a leaked, append-only
+  store. Equality is one `u32` compare, state hashing is a flat hash over
+  ids, and structural sharing is maximal by construction. Set/Map contents
+  are flat sorted id slices (the structural order `value_cmp`), so the
+  canonical form — and every user-visible enumeration order — matches the
+  earlier BTree representation exactly.
+- **Flat state arena** (`state::StateArena` + `state::SeenSet`): explored
+  states are `n_vars` consecutive ids in one `Vec`; the seen-set stores
+  only state ids (hashbrown `HashTable`) and reads the arena for
+  comparison — no per-state allocation, no duplicate keys.
+- **Bytecode VM** (`vm::{lower, Vm}`): the IR is lowered once into 8-byte
+  register-machine instructions. Short-circuit operators are conditional
+  jumps, builtins are resolved call sites taking their arguments from a
+  register window, `val`/`pureval`/let caching are indexed cache cells
+  (per-state caches keyed on a storage generation counter), and errors are
+  annotated from a pc→node side table — zero cost on the happy path.
+  Nondeterminism still goes through the `ChoiceCtl` replay oracle; lowering
+  preserves the evaluation order that makes replay deterministic.
+
+Parallel exploration remains future work.

@@ -106,7 +106,7 @@ pub fn extract_lasso(product: &Product, graph: &StateGraph, scc: &FairScc) -> La
 
     let states = nodes
         .iter()
-        .map(|&p| graph.states[product.nodes[p as usize].0 as usize].clone())
+        .map(|&p| graph.state_rc(product.nodes[p as usize].0))
         .collect();
 
     Lasso { states, loop_index }

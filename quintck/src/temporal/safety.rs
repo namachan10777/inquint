@@ -56,7 +56,7 @@ pub fn check_safety(conjuncts: &[SafetyConjunct], g: &StateGraph) -> SafetyOutco
     }
 
     // always(prop) conjuncts: states in BFS order → shortest counterexample
-    for s in 0..g.states.len() as u32 {
+    for s in 0..g.len() as u32 {
         for c in conjuncts {
             if let SafetyConjunct::AlwaysProp(prop) = c {
                 if prop.has_edge_atoms() {
@@ -79,6 +79,6 @@ pub fn check_safety(conjuncts: &[SafetyConjunct], g: &StateGraph) -> SafetyOutco
 fn violation_edge(g: &StateGraph, s: u32, e: u32) -> SafetyOutcome {
     let mut trace = g.trace_to(s);
     let t = g.targets[e as usize];
-    trace.push(g.states[t as usize].clone());
+    trace.push(g.state_rc(t));
     SafetyOutcome::Violation { trace }
 }

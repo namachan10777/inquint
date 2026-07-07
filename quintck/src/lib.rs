@@ -1,8 +1,3 @@
-// `Value` embeds `Rc<RefCell<..>>` only in its Lambda variant, which by
-// construction never enters containers or states (Ord/Hash panic on it),
-// so clippy's interior-mutability-in-keys lint is a false positive here.
-#![allow(clippy::mutable_key_type)]
-
 //! Explicit-state (TLC-like) model checker core for Quint.
 //!
 //! Consumes the flattened JSON IR from `quint compile --target=json`
@@ -21,3 +16,4 @@ pub mod state;
 pub mod successor;
 pub mod temporal;
 pub mod value;
+pub mod vm;

@@ -6,8 +6,9 @@
 
 use crate::choice::ChoiceCtl;
 use crate::error::QuintError;
-use crate::eval::{Compiler, Env};
+use crate::eval::Env;
 use crate::state::VarTable;
+use crate::vm::Lowerer;
 use quint_ast::{CompiledOutput, Declaration, OpQualifier, QuintName};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,12 +50,12 @@ pub fn run_tests(out: &CompiledOutput, names: &[String]) -> Result<Vec<TestRepor
         ));
     }
 
-    let mut compiler = Compiler::new(&out.table, &vars);
+    let mut compiler = Lowerer::new(&out.table, &vars);
     let compiled: Vec<(QuintName, crate::eval::CompiledExpr)> = selected
         .iter()
-        .map(|op| (op.name.clone(), compiler.compile(&op.expr)))
+        .map(|op| (op.name, compiler.compile(&op.expr)))
         .collect();
-    let storage = compiler.storage.clone();
+    let storage = compiler.storage();
 
     let mut reports = Vec::new();
     for (name, expr) in compiled {

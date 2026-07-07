@@ -4,10 +4,10 @@
 
 use crate::error::QuintError;
 use crate::spec::CompiledSpec;
-use crate::state::State;
+use crate::state::{SeenSet, State, StateArena};
 use crate::successor::enumerate;
+use crate::value::Value;
 use quint_ast::QuintName;
-use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 
 pub struct CheckConfig {
@@ -54,33 +54,13 @@ pub struct CheckError {
     pub trace: Vec<State>,
 }
 
-struct Arena {
-    entries: Vec<(State, Option<u32>, u32)>, // (state, parent, depth)
-}
-
-impl Arena {
-    fn trace(&self, mut id: u32) -> Vec<State> {
-        let mut trace = Vec::new();
-        loop {
-            let (state, parent, _) = &self.entries[id as usize];
-            trace.push(state.clone());
-            match parent {
-                Some(p) => id = *p,
-                None => break,
-            }
-        }
-        trace.reverse();
-        trace
-    }
-}
-
 pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<CheckError>> {
-    let mut arena = Arena { entries: Vec::new() };
-    let mut seen: FxHashMap<State, u32> = FxHashMap::default();
+    let mut arena = StateArena::new(spec.vars.len());
+    let mut seen = SeenSet::default();
     let mut frontier: VecDeque<u32> = VecDeque::new();
     let mut max_depth: u32 = 0;
 
-    let err_with = |arena: &Arena, id: Option<u32>, error: QuintError| {
+    let err_with = |arena: &StateArena, id: Option<u32>, error: QuintError| {
         Box::new(CheckError {
             error,
             trace: id.map(|i| arena.trace(i)).unwrap_or_default(),
@@ -88,10 +68,10 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
     };
 
     // Check the invariants on a state; return the first violated one.
-    let check_invs = |state: &State| -> Result<Option<QuintName>, QuintError> {
+    let check_invs = |state: &[Value]| -> Result<Option<QuintName>, QuintError> {
         for (name, inv) in &spec.invariants {
             if !spec.eval_invariant_at(state, inv)?.as_bool() {
-                return Ok(Some(name.clone()));
+                return Ok(Some(*name));
             }
         }
         Ok(None)
@@ -101,9 +81,8 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
     let initial = enumerate(&spec.init, &spec.storage, None)
         .map_err(|e| err_with(&arena, None, e))?;
     for state in initial {
-        let id = arena.entries.len() as u32;
-        arena.entries.push((state.clone(), None, 0));
-        seen.insert(state.clone(), id);
+        let (id, fresh) = seen.insert_or_get(&mut arena, &state, None, 0);
+        debug_assert!(fresh, "enumerate returns deduplicated states");
         match check_invs(&state) {
             Ok(Some(invariant)) => {
                 return Ok(CheckOutcome::InvariantViolation {
@@ -118,16 +97,20 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
     }
 
     let mut last_report = std::time::Instant::now();
+    let mut state_buf: Vec<Value> = Vec::with_capacity(spec.vars.len());
 
     while let Some(id) = frontier.pop_front() {
-        let (state, _, depth) = arena.entries[id as usize].clone();
+        let depth = arena.depth(id);
         max_depth = max_depth.max(depth);
 
         if cfg.max_steps.is_some_and(|max| depth >= max) {
             continue;
         }
 
-        let successors = enumerate(&spec.step, &spec.storage, Some(&state))
+        state_buf.clear();
+        state_buf.extend_from_slice(arena.get(id));
+
+        let successors = enumerate(&spec.step, &spec.storage, Some(&state_buf))
             .map_err(|e| err_with(&arena, Some(id), e))?;
 
         if successors.is_empty() && cfg.deadlock {
@@ -137,12 +120,10 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
         }
 
         for succ in successors {
-            if seen.contains_key(&succ) {
+            let (succ_id, fresh) = seen.insert_or_get(&mut arena, &succ, Some(id), depth + 1);
+            if !fresh {
                 continue;
             }
-            let succ_id = arena.entries.len() as u32;
-            arena.entries.push((succ.clone(), Some(id), depth + 1));
-            seen.insert(succ.clone(), succ_id);
             match check_invs(&succ) {
                 Ok(Some(invariant)) => {
                     return Ok(CheckOutcome::InvariantViolation {
@@ -157,10 +138,10 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
 
             if cfg
                 .max_states
-                .is_some_and(|max| arena.entries.len() as u64 >= max)
+                .is_some_and(|max| arena.len() as u64 >= max)
             {
                 return Ok(CheckOutcome::Incomplete {
-                    states: arena.entries.len() as u64,
+                    states: arena.len() as u64,
                 });
             }
         }
@@ -168,7 +149,7 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
         if last_report.elapsed().as_secs() >= 1 {
             eprintln!(
                 "  {} states, depth {}, frontier {}",
-                arena.entries.len(),
+                arena.len(),
                 depth,
                 frontier.len()
             );
@@ -177,7 +158,7 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
     }
 
     Ok(CheckOutcome::Pass {
-        states: arena.entries.len() as u64,
+        states: arena.len() as u64,
         max_depth,
     })
 }
