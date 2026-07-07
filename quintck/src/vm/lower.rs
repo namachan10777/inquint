@@ -36,7 +36,23 @@ pub struct Lowerer<'t> {
     entry_memo: FxHashMap<QuintId, FnId>,
     /// Guard-hoisting analysis memo (expression node id → info).
     conj_memo: FxHashMap<QuintId, ConjInfo>,
+    /// Let-bound defs elided by single-use inlining: references lower the
+    /// body in place instead of a cached-cell call.
+    inline_lets: FxHashSet<QuintId>,
+    /// Inlined callee parameters: param id → register holding the argument.
+    param_override: FxHashMap<QuintId, u16>,
+    /// (node count, contains a lambda literal) per expression, memoized.
+    size_memo: FxHashMap<QuintId, (u32, bool)>,
+    /// "May exercise a choice point" per expression, memoized (follows
+    /// user-defined operator references).
+    choice_memo: FxHashMap<QuintId, bool>,
+    /// Defs currently being inlined (re-entrance guard).
+    inline_stack: FxHashSet<QuintId>,
 }
+
+/// Callee bodies up to this many IR nodes are inlined at static call
+/// sites (each site re-lowers the body; the bound caps code growth).
+const INLINE_MAX_NODES: u32 = 24;
 
 /// What a conjunct may do, for guard hoisting: whether it is pure and
 /// deterministic (no state writes, no choices, no run/temporal operators),
@@ -176,6 +192,11 @@ impl<'t> Lowerer<'t> {
             lambda_memo: FxHashMap::default(),
             entry_memo: FxHashMap::default(),
             conj_memo: FxHashMap::default(),
+            inline_lets: FxHashSet::default(),
+            param_override: FxHashMap::default(),
+            size_memo: FxHashMap::default(),
+            choice_memo: FxHashMap::default(),
+            inline_stack: FxHashSet::default(),
         }
     }
 
@@ -267,6 +288,128 @@ impl<'t> Lowerer<'t> {
             }
         }
         info
+    }
+
+    /// References to let-bound def `target` inside `expr`, saturated at 2.
+    /// References under a lambda literal or inside a nested definition
+    /// body count as 2: those may evaluate repeatedly (or not at all in a
+    /// different dynamic extent), so single-use inlining must not fire.
+    fn count_refs(&self, expr: &QuintEx, target: QuintId, guarded: bool) -> u32 {
+        let hit = |id: &QuintId| {
+            matches!(
+                self.table.get(id),
+                Some(LookupDefinition::Definition(Declaration::OpDef(op))) if op.id == target
+            )
+        };
+        match expr {
+            QuintEx::Int { .. } | QuintEx::Bool { .. } | QuintEx::Str { .. } => 0,
+            QuintEx::Name { id, .. } => {
+                if hit(id) {
+                    if guarded { 2 } else { 1 }
+                } else {
+                    0
+                }
+            }
+            QuintEx::Lambda { expr, .. } => self.count_refs(expr, target, true).min(2),
+            QuintEx::App { id, args, .. } => {
+                let mut n = if hit(id) {
+                    if guarded { 2 } else { 1 }
+                } else {
+                    0
+                };
+                for arg in args {
+                    n += self.count_refs(arg, target, guarded);
+                    if n >= 2 {
+                        return 2;
+                    }
+                }
+                n
+            }
+            QuintEx::Let { opdef, expr, .. } => {
+                let n = self.count_refs(&opdef.expr, target, true)
+                    + self.count_refs(expr, target, guarded);
+                n.min(2)
+            }
+        }
+    }
+
+    /// (IR node count, contains-a-lambda-literal) of `expr`, memoized.
+    /// Does not follow references — inlining duplicates only the
+    /// syntactic body.
+    fn ir_size(&mut self, expr: &QuintEx) -> (u32, bool) {
+        if let Some(&s) = self.size_memo.get(&expr.id()) {
+            return s;
+        }
+        let r = match expr {
+            QuintEx::Int { .. }
+            | QuintEx::Bool { .. }
+            | QuintEx::Str { .. }
+            | QuintEx::Name { .. } => (1, false),
+            QuintEx::Lambda { expr, .. } => {
+                let (n, _) = self.ir_size(expr);
+                (n + 1, true)
+            }
+            QuintEx::App { args, .. } => {
+                let mut n = 1;
+                let mut lam = false;
+                for arg in args {
+                    let (an, al) = self.ir_size(arg);
+                    n += an;
+                    lam |= al;
+                }
+                (n, lam)
+            }
+            QuintEx::Let { opdef, expr, .. } => {
+                let (a, la) = self.ir_size(&opdef.expr);
+                let (b, lb) = self.ir_size(expr);
+                (a + b + 1, la || lb)
+            }
+        };
+        self.size_memo.insert(expr.id(), r);
+        r
+    }
+
+    /// Whether evaluating `expr` may exercise a choice point (nondet
+    /// binding, `oneOf`, `actionAny`), following user-defined operator
+    /// references. Conservative for parameter-held operators.
+    fn has_choice(&mut self, expr: &QuintEx) -> bool {
+        if let Some(&b) = self.choice_memo.get(&expr.id()) {
+            return b;
+        }
+        // pre-seed against reference cycles (quint has none, but stay safe)
+        self.choice_memo.insert(expr.id(), false);
+        let deref_has_choice = |me: &mut Self, id: &QuintId| match me.table.get(id) {
+            Some(LookupDefinition::Definition(Declaration::OpDef(op))) => {
+                let e = op.expr.clone();
+                me.has_choice(&e)
+            }
+            Some(LookupDefinition::Param(_)) => true, // unknown body
+            _ => false,
+        };
+        let b = match expr {
+            QuintEx::Int { .. } | QuintEx::Bool { .. } | QuintEx::Str { .. } => false,
+            QuintEx::Name { id, .. } => deref_has_choice(self, id),
+            QuintEx::Lambda { expr, .. } => {
+                let e = (**expr).clone();
+                self.has_choice(&e)
+            }
+            QuintEx::App { id, opcode, args } => {
+                matches!(opcode.as_str(), "oneOf" | "actionAny")
+                    || deref_has_choice(self, id)
+                    || args.iter().any(|a| {
+                        let a = a.clone();
+                        self.has_choice(&a)
+                    })
+            }
+            QuintEx::Let { opdef, expr, .. } => {
+                opdef.qualifier == OpQualifier::Nondet || {
+                    let (a, b) = (opdef.expr.clone(), (**expr).clone());
+                    self.has_choice(&a) || self.has_choice(&b)
+                }
+            }
+        };
+        self.choice_memo.insert(expr.id(), b);
+        b
     }
 
     /// Hand over the finished (immutable) program.
@@ -400,9 +543,29 @@ impl<'t> Lowerer<'t> {
     /// Emit code producing a definition's value into `dst`.
     fn lower_def_value(&mut self, f: &mut FnB, def: &LookupDefinition, dst: u16) {
         match def {
-            LookupDefinition::Definition(Declaration::OpDef(op)) => match self.def_ref(op) {
+            LookupDefinition::Definition(Declaration::OpDef(op)) => {
+                // single-use let: lower the definition in place
+                if self.inline_lets.contains(&op.id) {
+                    let e = op.expr.clone();
+                    self.lower_into(f, &e, dst);
+                    return;
+                }
+                match self.def_ref(op) {
                 DefRef::Lambda(v, _) => self.emit_load_imm(f, dst, v),
                 DefRef::Fn(fnid) => {
+                    // small zero-arg def: evaluate per reference — inline
+                    // the body instead of a call
+                    let e = op.expr.clone();
+                    let (size, _) = self.ir_size(&e);
+                    if size <= INLINE_MAX_NODES
+                        && !self.inline_stack.contains(&op.id)
+                        && !self.has_choice(&e)
+                    {
+                        self.inline_stack.insert(op.id);
+                        self.lower_into(f, &e, dst);
+                        self.inline_stack.remove(&op.id);
+                        return;
+                    }
                     let cs = self.call_site(f, fnid);
                     f.emit(Op::Call, dst, cs, 0);
                 }
@@ -430,7 +593,7 @@ impl<'t> Lowerer<'t> {
                         u16_of(cell as usize, "pure cell"),
                     );
                 }
-            },
+            }}
             LookupDefinition::Definition(Declaration::Var { id, name }) => {
                 let index = *self
                     .var_index
@@ -448,8 +611,13 @@ impl<'t> Lowerer<'t> {
                 );
             }
             LookupDefinition::Param(p) => {
-                let slot = self.param_slot(p);
-                f.emit(Op::LoadParam, dst, u16_of(slot as usize, "param slot"), 0);
+                if let Some(&reg) = self.param_override.get(&p.id) {
+                    // inlined callee parameter: the argument register
+                    f.emit(Op::Move, dst, reg, 0);
+                } else {
+                    let slot = self.param_slot(p);
+                    f.emit(Op::LoadParam, dst, u16_of(slot as usize, "param slot"), 0);
+                }
             }
             d => panic!("cannot compile reference to {d:?}"),
         }
@@ -854,6 +1022,42 @@ impl<'t> Lowerer<'t> {
                 for (i, arg) in args.iter().enumerate() {
                     self.lower_into(f, arg, ab + i as u16);
                 }
+                // Inline small, choice-free lambda bodies at the call
+                // site: parameters resolve to the argument registers
+                // (no LoadParam / call frame). Bodies containing lambda
+                // literals are excluded — such a literal may capture the
+                // callee's parameters, which have no cells when inlined.
+                if let LookupDefinition::Definition(Declaration::OpDef(op)) = &def {
+                    if let QuintEx::Lambda { params, expr: body, .. } = &op.expr {
+                        let body = body.clone();
+                        let params = params.clone();
+                        let (size, has_lambda) = self.ir_size(&body);
+                        if size <= INLINE_MAX_NODES
+                            && !has_lambda
+                            && !self.inline_stack.contains(&op.id)
+                            && !self.has_choice(&body)
+                        {
+                            let saved: Vec<_> = params
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| {
+                                    self.param_override.insert(p.id, ab + i as u16)
+                                })
+                                .collect();
+                            self.inline_stack.insert(op.id);
+                            self.lower_into(f, &body, dst);
+                            self.inline_stack.remove(&op.id);
+                            for (p, old) in params.iter().zip(saved) {
+                                match old {
+                                    Some(r) => self.param_override.insert(p.id, r),
+                                    None => self.param_override.remove(&p.id),
+                                };
+                            }
+                            f.free_to(mark);
+                            return;
+                        }
+                    }
+                }
                 let direct = match &def {
                     LookupDefinition::Definition(Declaration::OpDef(op)) => {
                         match self.def_ref(op) {
@@ -1005,6 +1209,20 @@ impl<'t> Lowerer<'t> {
                     return;
                 }
             }
+        }
+
+        // Single-use elision: a binding referenced at most once, outside
+        // any lambda/nested-def body, needs no cell — zero references
+        // never evaluate (call-by-need), one reference evaluates the
+        // definition right at the reference point, exactly like the
+        // cached-cell call would.
+        if opdef.qualifier != OpQualifier::Nondet
+            && !self.def_refs.contains_key(&opdef.id)
+            && self.count_refs(body, opdef.id, false) <= 1
+        {
+            self.inline_lets.insert(opdef.id);
+            self.lower_into(f, body, dst);
+            return;
         }
 
         // Regular let: call-by-need through the shared cell; save/restore

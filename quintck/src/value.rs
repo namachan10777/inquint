@@ -144,10 +144,10 @@ struct ValueStore {
     lambdas_len: Mutex<u32>,
 }
 
-const N_SHARDS: usize = 64;
+const N_SHARDS: usize = 512;
 
 fn shard_of(hash: u64) -> usize {
-    (hash >> 57) as usize & (N_SHARDS - 1)
+    (hash >> 54) as usize & (N_SHARDS - 1)
 }
 
 /// Sentinel key for lambdas and symbolic set forms: comparing those is a
@@ -304,7 +304,14 @@ impl ValueStore {
         };
         match data {
             ValueData::Bool(b) => rank | ((*b as u64) << 48),
-            ValueData::Int(n) => rank | (((*n as u64) ^ (1u64 << 63)) >> 8),
+            ValueData::Int(n) => {
+                // Exact (order-preserving, injective) for |n| < 2^54;
+                // saturated outside — equal keys there fall back to the
+                // deep compare, which stays correct.
+                const LO: i64 = -(1 << 54);
+                const HI: i64 = (1 << 54) - 1;
+                rank | ((*n).clamp(LO, HI) - LO) as u64
+            }
             ValueData::Str(s) => rank | str_prefix7(s.as_str()),
             ValueData::Set(es) | ValueData::Tuple(es) | ValueData::List(es) => {
                 first_child(es.first())
@@ -544,6 +551,114 @@ fn value_cmp_in(s: &ValueStore, a: Value, b: Value) -> Ordering {
         return ea.key.cmp(&eb.key);
     }
     finish_cmp(value_cmp_deep(ea.data, eb.data))
+}
+
+// ---------------------------------------------------------------------------
+// Map update memo
+// ---------------------------------------------------------------------------
+
+/// Per-thread direct-mapped memo for `Map.set`/`Map.put`: map updates
+/// dominate the transition relation in message-passing specs, and the
+/// same (map, key, value) update recurs across huge numbers of states.
+/// A hit skips the pair-vector rebuild, the full-map hash and the intern
+/// (including its shard lock) entirely. Lossy (collisions overwrite) and
+/// bounded (1 MiB per thread).
+struct UpdateEntry {
+    map: u32,
+    key: u32,
+    val: u32,
+    /// 0 = empty slot (value ids are NonZeroU32).
+    res: u32,
+}
+
+const UPDATE_CACHE_BITS: u32 = 16;
+
+thread_local! {
+    static UPDATE_CACHE: RefCell<Box<[UpdateEntry]>> = RefCell::new(
+        (0..1usize << UPDATE_CACHE_BITS)
+            .map(|_| UpdateEntry { map: 0, key: 0, val: 0, res: 0 })
+            .collect(),
+    );
+}
+
+fn update_slot(map: Value, key: Value, val: Value, must_exist: bool) -> usize {
+    // fx-style mix of the three ids + the op tag
+    let h = (map.to_bits() as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add((key.to_bits() as u64) << 1)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add((val.to_bits() as u64) << 1 | must_exist as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> (64 - UPDATE_CACHE_BITS)) as usize
+}
+
+/// `Map.put` / `Map.set` with memoization. `key` and `val` must be
+/// normalized. `must_exist` selects `set` semantics (error on a missing
+/// key — errors are not cached).
+pub fn map_update_cached(
+    map: Value,
+    key: Value,
+    val: Value,
+    must_exist: bool,
+) -> EvalResult {
+    let slot = update_slot(map, key, val, must_exist);
+    let hit = UPDATE_CACHE.with_borrow(|c| {
+        let e = &c[slot];
+        if e.res != 0 && e.map == map.to_bits() && e.key == key.to_bits() && e.val == val.to_bits()
+        {
+            Some(Value::from_bits(e.res))
+        } else {
+            None
+        }
+    });
+    if let Some(res) = hit {
+        return Ok(res);
+    }
+    let entries = map.as_map();
+    let res = match map_find_by_id(entries, key) {
+        Some(i) => {
+            if entries[i].1 == val {
+                map // no-op update: the result is the map itself
+            } else {
+                let mut out = entries.to_vec();
+                out[i].1 = val;
+                Value::map_sorted(out)
+            }
+        }
+        None if must_exist => {
+            return Err(QuintError::new(
+                "QNT507",
+                "Called 'set' with a non-existing key",
+            ));
+        }
+        None => {
+            let mut out = entries.to_vec();
+            let i = map_find(&out, key).unwrap_err();
+            out.insert(i, (key, val));
+            Value::map_sorted(out)
+        }
+    };
+    UPDATE_CACHE.with_borrow_mut(|c| {
+        c[slot] = UpdateEntry {
+            map: map.to_bits(),
+            key: key.to_bits(),
+            val: val.to_bits(),
+            res: res.to_bits(),
+        };
+    });
+    Ok(res)
+}
+
+/// Position of a (normalized) key in sorted map entries, by id: keys are
+/// normalized, so structural equality is id equality — a small map scans
+/// with plain `u32` compares (zero store accesses); larger maps binary
+/// search. Only for *lookup*; insertion position needs [`map_find`].
+pub fn map_find_by_id(entries: &[(Value, Value)], key: Value) -> Option<usize> {
+    if entries.len() <= 32 {
+        entries.iter().position(|&(k, _)| k == key)
+    } else {
+        map_find(entries, key).ok()
+    }
 }
 
 /// Binary search over sorted map entries, one store access for the whole
@@ -1156,10 +1271,10 @@ impl Value {
             .map(|i| values[i])
     }
 
-    /// Map lookup by (normalized) key: binary search over the sorted entries.
+    /// Map lookup by (normalized) key: id scan / binary search.
     pub fn map_get(self, key: Value) -> Option<Value> {
         let entries = self.as_map();
-        map_find(entries, key).ok().map(|i| entries[i].1)
+        map_find_by_id(entries, key).map(|i| entries[i].1)
     }
 }
 

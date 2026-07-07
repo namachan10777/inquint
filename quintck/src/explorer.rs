@@ -165,7 +165,7 @@ struct ShardedFpSet {
     shards: Box<[std::sync::Mutex<hashbrown::HashTable<u64>>]>,
 }
 
-const FP_SHARDS: usize = 256;
+const FP_SHARDS: usize = 4096;
 
 impl ShardedFpSet {
     fn new() -> Self {
@@ -178,7 +178,7 @@ impl ShardedFpSet {
 
     /// Insert; returns true if the fingerprint was fresh.
     fn insert(&self, fp: u64) -> bool {
-        let mut shard = self.shards[(fp >> 56) as usize & (FP_SHARDS - 1)].lock().unwrap();
+        let mut shard = self.shards[(fp >> 52) as usize & (FP_SHARDS - 1)].lock().unwrap();
         if shard.find(fp, |&e| e == fp).is_some() {
             return false;
         }

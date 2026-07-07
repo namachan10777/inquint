@@ -252,30 +252,20 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             })
         },
         "set" => |_, args| {
-            let entries = args[0].as_map();
-            let key = args[1].normalize()?;
-            match crate::value::map_find(entries, key) {
-                Ok(i) => {
-                    let mut out = entries.to_vec();
-                    out[i].1 = args[2].normalize()?;
-                    Ok(Value::map_sorted(out))
-                }
-                Err(_) => Err(QuintError::new(
-                    "QNT507",
-                    "Called 'set' with a non-existing key",
-                )),
-            }
+            crate::value::map_update_cached(
+                args[0],
+                args[1].normalize()?,
+                args[2].normalize()?,
+                true,
+            )
         },
         "put" => |_, args| {
-            let entries = args[0].as_map();
-            let key = args[1].normalize()?;
-            let value = args[2].normalize()?;
-            let mut out = entries.to_vec();
-            match crate::value::map_find(&out, key) {
-                Ok(i) => out[i].1 = value,
-                Err(i) => out.insert(i, (key, value)),
-            }
-            Ok(Value::map_sorted(out))
+            crate::value::map_update_cached(
+                args[0],
+                args[1].normalize()?,
+                args[2].normalize()?,
+                false,
+            )
         },
         "keys" => |_, args| {
             // map keys are sorted by value_cmp already

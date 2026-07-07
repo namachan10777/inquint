@@ -133,7 +133,10 @@ Parallel BFS over hash-consed values on a bytecode VM:
   comparisons in conjunctions compile to single guard-branch opcodes,
   `eq`/`neq`/`not` and record-field access get dedicated opcodes (equality
   is an id compare thanks to hash-consing), and static call sites carry
-  pre-resolved parameter cells.
+  pre-resolved parameter slots. Lowering also inlines: single-use `let`
+  bindings evaluate in place (no cell), and small choice-free operator
+  bodies are expanded at their call sites with parameters resolved to the
+  argument registers — no call frame, no parameter-bank traffic.
 
 - **Parallel BFS** (default: all cores, `--threads N`): level-synchronized
   exploration with chunk-granularity work stealing — each level's frontier

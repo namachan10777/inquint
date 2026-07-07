@@ -101,14 +101,12 @@ pub fn vm_builtin(op: &str) -> Option<VmBuiltin> {
         "setBy" => |vm, env, args| {
             let entries = args[0].as_map();
             let key = args[1].normalize()?;
-            match crate::value::map_find(entries, key) {
-                Ok(i) => {
+            match crate::value::map_find_by_id(entries, key) {
+                Some(i) => {
                     let new = vm.call_lambda(env, args[2], &[entries[i].1])?.normalize()?;
-                    let mut out = entries.to_vec();
-                    out[i].1 = new;
-                    Ok(Value::map_sorted(out))
+                    crate::value::map_update_cached(args[0], key, new, true)
                 }
-                Err(_) => Err(QuintError::new(
+                None => Err(QuintError::new(
                     "QNT507",
                     format!("Called 'setBy' with a non-existing key {key}"),
                 )),
