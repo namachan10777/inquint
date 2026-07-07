@@ -1,2 +1,4 @@
 _apalache-out/
 target/
+bench/results.parquet
+bench/charts/
