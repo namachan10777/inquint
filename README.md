@@ -107,10 +107,15 @@ Single-threaded BFS over hash-consed values on a bytecode VM:
   are flat sorted id slices (the structural order `value_cmp`), so the
   canonical form — and every user-visible enumeration order — matches the
   earlier BTree representation exactly.
-- **Flat state arena** (`state::StateArena` + `state::SeenSet`): explored
-  states are `n_vars` consecutive ids in one `Vec`; the seen-set stores
-  only state ids (hashbrown `HashTable`) and reads the arena for
-  comparison — no per-state allocation, no duplicate keys.
+- **TLC-style fingerprint exploration** (default): the seen-set holds
+  64-bit fingerprints only and full states exist only on the (flat) BFS
+  frontier — ~14 bytes per explored state (fingerprint table + one parent
+  index). Probabilistically sound like TLC: a fingerprint collision would
+  silently prune a state (~n²/2⁶⁵). Counterexample traces are rebuilt by a
+  deterministic re-run that keeps just the states on the parent path.
+  `--exact-states` switches to exact deduplication over a flat state arena
+  (`state::StateArena` + `state::SeenSet`) — no per-state allocation, no
+  duplicate keys. Temporal checking always keeps the full graph.
 - **Bytecode VM** (`vm::{lower, Vm}`): the IR is lowered once into 8-byte
   register-machine instructions. Short-circuit operators are conditional
   jumps, builtins are resolved call sites taking their arguments from a

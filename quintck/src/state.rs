@@ -76,6 +76,44 @@ impl StateArena {
     }
 }
 
+/// TLC-style seen set: 64-bit fingerprints only, no state bodies.
+/// Probabilistically sound — a fingerprint collision would silently prune
+/// an unexplored state (with SipHash-quality 64-bit fingerprints the
+/// probability is ~n²/2⁶⁵; the same trade-off TLC makes by default).
+#[derive(Default)]
+pub struct FpSet {
+    table: hashbrown::HashTable<u64>,
+}
+
+impl FpSet {
+    /// Fingerprint of a state (its value-id sequence). foldhash with a
+    /// fixed seed — deterministic across runs and processes, with real
+    /// 64-bit avalanche (FxHash would not qualify).
+    pub fn fingerprint(s: &[Value]) -> u64 {
+        use std::hash::BuildHasher;
+        const FP_SEED: u64 = 0x5155_494e_5443_4b21; // "QUINTCK!"
+        foldhash::fast::FixedState::with_seed(FP_SEED).hash_one(s)
+    }
+
+    /// Insert a fingerprint; returns true if it was fresh. The fingerprint
+    /// is its own hash (already uniform).
+    pub fn insert(&mut self, fp: u64) -> bool {
+        if self.table.find(fp, |&e| e == fp).is_some() {
+            return false;
+        }
+        self.table.insert_unique(fp, fp, |&e| e);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+}
+
 /// Seen-set over arena states: stores only the state id; hashing and
 /// comparison read the flat arena slices. States are id sequences, so a
 /// hash is a flat `u32` hash and equality a memcmp.

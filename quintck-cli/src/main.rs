@@ -48,6 +48,12 @@ struct Cli {
     #[arg(long)]
     max_states: Option<u64>,
 
+    /// Keep full states for exact deduplication. By default the seen-set
+    /// holds 64-bit fingerprints only (TLC-style): far less memory, with a
+    /// negligible probability of missing a state on a fingerprint collision.
+    #[arg(long)]
+    exact_states: bool,
+
     /// Write the counterexample trace in ITF format to this file
     #[arg(long)]
     out_itf: Option<PathBuf>,
@@ -140,6 +146,7 @@ fn main() -> ExitCode {
         },
         deadlock: !cli.no_deadlock,
         max_states: cli.max_states,
+        exact_states: cli.exact_states,
     };
 
     let source = cli.input.display().to_string();

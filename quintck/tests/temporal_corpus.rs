@@ -30,6 +30,7 @@ fn cfg(deadlock: bool) -> CheckConfig {
         max_steps: None,
         deadlock,
         max_states: None,
+        exact_states: false,
     }
 }
 

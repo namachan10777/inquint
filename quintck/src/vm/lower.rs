@@ -19,7 +19,7 @@ use crate::value::Value;
 use quint_ast::{
     Declaration, LambdaParam, LookupDefinition, LookupTable, OpDef, OpQualifier, QuintEx, QuintId,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -35,6 +35,17 @@ pub struct Lowerer<'t> {
     lambda_memo: FxHashMap<QuintId, (Value, FnId)>,
     /// Top-level (zero-param) function per expression node id.
     entry_memo: FxHashMap<QuintId, FnId>,
+    /// Guard-hoisting analysis memo (expression node id → info).
+    conj_memo: FxHashMap<QuintId, ConjInfo>,
+}
+
+/// What a conjunct may do, for guard hoisting: whether it is pure and
+/// deterministic (no state writes, no choices, no run/temporal operators),
+/// and which let-scoped definitions it (transitively) references.
+#[derive(Clone, Default)]
+struct ConjInfo {
+    pure: bool,
+    refs: FxHashSet<QuintId>,
 }
 
 /// How a definition is referenced in expression position.
@@ -153,7 +164,98 @@ impl<'t> Lowerer<'t> {
             def_refs: FxHashMap::default(),
             lambda_memo: FxHashMap::default(),
             entry_memo: FxHashMap::default(),
+            conj_memo: FxHashMap::default(),
         }
+    }
+
+    /// Analyze a conjunct for guard hoisting (memoized by node id).
+    /// Conservative: anything unresolvable or dynamic counts as impure.
+    fn conj_info(&mut self, expr: &QuintEx) -> ConjInfo {
+        let id = expr.id();
+        if let Some(info) = self.conj_memo.get(&id) {
+            return info.clone();
+        }
+        // provisional pessimistic entry (cycle guard; quint has no
+        // recursion, this is defensive)
+        self.conj_memo.insert(id, ConjInfo::default());
+        let info = self.conj_info_core(expr);
+        self.conj_memo.insert(id, info.clone());
+        info
+    }
+
+    fn conj_info_core(&mut self, expr: &QuintEx) -> ConjInfo {
+        /// Operators that make an expression non-hoistable: state writes,
+        /// choice points, run-test control, next(), and output.
+        const IMPURE_OPS: &[&str] = &[
+            "assign",
+            "actionAny",
+            "oneOf",
+            "next",
+            "then",
+            "reps",
+            "expect",
+            "q::debug",
+        ];
+        let mut info = ConjInfo {
+            pure: true,
+            refs: FxHashSet::default(),
+        };
+        let merge = |info: &mut ConjInfo, other: ConjInfo| {
+            info.pure &= other.pure;
+            info.refs.extend(other.refs);
+        };
+        match expr {
+            QuintEx::Int { .. } | QuintEx::Bool { .. } | QuintEx::Str { .. } => {}
+            QuintEx::Name { id, .. } => match self.table.get(id) {
+                Some(LookupDefinition::Definition(Declaration::OpDef(op))) => {
+                    let op = op.clone();
+                    let scoped = op.depth.is_some_and(|d| d != 0);
+                    merge(&mut info, self.conj_info(&op.expr));
+                    if scoped {
+                        info.refs.insert(op.id);
+                    }
+                }
+                Some(LookupDefinition::Definition(
+                    Declaration::Var { .. } | Declaration::Const { .. },
+                ))
+                | Some(LookupDefinition::Param(_))
+                | None => {}
+                _ => info.pure = false,
+            },
+            QuintEx::Lambda { expr, .. } => merge(&mut info, self.conj_info(expr)),
+            QuintEx::App { id, opcode, args } => {
+                if IMPURE_OPS.contains(&opcode.as_str()) {
+                    info.pure = false;
+                }
+                match self.table.get(id) {
+                    // user-defined operator: analyze its body
+                    Some(LookupDefinition::Definition(Declaration::OpDef(op))) => {
+                        let op = op.clone();
+                        let scoped = op.depth.is_some_and(|d| d != 0);
+                        merge(&mut info, self.conj_info(&op.expr));
+                        if scoped {
+                            info.refs.insert(op.id);
+                        }
+                    }
+                    // applying a parameter-held operator: its body is
+                    // unknown here — conservative
+                    Some(LookupDefinition::Param(_)) => info.pure = false,
+                    Some(_) => info.pure = false,
+                    None => {} // builtin
+                }
+                for arg in args {
+                    merge(&mut info, self.conj_info(arg));
+                }
+            }
+            QuintEx::Let { opdef, expr, .. } => {
+                if opdef.qualifier == OpQualifier::Nondet {
+                    info.pure = false;
+                }
+                merge(&mut info, self.conj_info(&opdef.expr.clone()));
+                merge(&mut info, self.conj_info(expr));
+            }
+        }
+        info
     }
 
     pub fn vm_handle(&self) -> Rc<RefCell<Vm>> {
@@ -399,26 +501,11 @@ impl<'t> Lowerer<'t> {
                 f.free_to(mark);
             }
 
-            "and" | "actionAll" if args.is_empty() => {
-                self.emit_load_imm(f, dst, Value::bool(true));
-            }
             "or" | "actionAny" if args.is_empty() => {
                 self.emit_load_imm(f, dst, Value::bool(false));
             }
 
-            "and" => {
-                let mut jumps = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    self.lower_into(f, arg, dst);
-                    if i + 1 < args.len() {
-                        jumps.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
-                    }
-                }
-                let join = f.pc();
-                for j in jumps {
-                    f.patch_b(j, join);
-                }
-            }
+            "and" => self.lower_and(f, args, dst),
 
             "or" => {
                 let mut jumps = Vec::new();
@@ -456,24 +543,7 @@ impl<'t> Lowerer<'t> {
                 f.patch_b(j_join, join);
             }
 
-            "actionAll" => {
-                f.emit(Op::SnapNext, 0, 0, 0);
-                let mut fails = Vec::new();
-                for arg in args {
-                    self.lower_into(f, arg, dst);
-                    fails.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
-                }
-                f.emit(Op::DropSnap, 0, 0, 0);
-                let j_join = f.emit(Op::Jump, 0, 0, 0);
-                let rollback = f.pc();
-                for j in fails {
-                    f.patch_b(j, rollback);
-                }
-                // dst is already false on this path
-                f.emit(Op::RestoreSnapPop, 0, 0, 0);
-                let join = f.pc();
-                f.patch_b(j_join, join);
-            }
+            "actionAll" => self.lower_action_all(f, args, dst),
 
             "actionAny" => {
                 let tbl = u16_of(f.branch_tables.len(), "branch table");
@@ -557,6 +627,50 @@ impl<'t> Lowerer<'t> {
 
             _ => self.lower_call_or_builtin(f, id, opcode, args, dst),
         }
+    }
+
+    /// Short-circuit conjunction (empty ⇒ true).
+    fn lower_and(&mut self, f: &mut FnB, args: &[QuintEx], dst: u16) {
+        if args.is_empty() {
+            self.emit_load_imm(f, dst, Value::bool(true));
+            return;
+        }
+        let mut jumps = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            self.lower_into(f, arg, dst);
+            if i + 1 < args.len() {
+                jumps.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
+            }
+        }
+        let join = f.pc();
+        for j in jumps {
+            f.patch_b(j, join);
+        }
+    }
+
+    /// Action conjunction: roll back next-state writes if any conjunct is
+    /// disabled (empty ⇒ true).
+    fn lower_action_all(&mut self, f: &mut FnB, args: &[QuintEx], dst: u16) {
+        if args.is_empty() {
+            self.emit_load_imm(f, dst, Value::bool(true));
+            return;
+        }
+        f.emit(Op::SnapNext, 0, 0, 0);
+        let mut fails = Vec::new();
+        for arg in args {
+            self.lower_into(f, arg, dst);
+            fails.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
+        }
+        f.emit(Op::DropSnap, 0, 0, 0);
+        let j_join = f.emit(Op::Jump, 0, 0, 0);
+        let rollback = f.pc();
+        for j in fails {
+            f.patch_b(j, rollback);
+        }
+        // dst is already false on this path
+        f.emit(Op::RestoreSnapPop, 0, 0, 0);
+        let join = f.pc();
+        f.patch_b(j_join, join);
     }
 
     fn lower_match(&mut self, f: &mut FnB, args: &[QuintEx], dst: u16) {
@@ -683,12 +797,53 @@ impl<'t> Lowerer<'t> {
                     let mark = f.next_reg;
                     let r_set = f.alloc(1);
                     self.lower_into(f, &args[0], r_set);
+
+                    // Guard hoisting: when the body is a conjunction, its
+                    // leading pure conjuncts that don't reference this
+                    // binding are evaluated *before* the choice point — a
+                    // false guard then disables the whole action in one
+                    // run instead of once per pick. Pure + choice-free, so
+                    // the values and ChoiceCtl replay order are unchanged;
+                    // evaluation order stays left-to-right (prefix only).
+                    let (conj_kind, conj_args): (Option<&str>, &[QuintEx]) = match body {
+                        QuintEx::App { opcode, args, .. }
+                            if opcode.as_str() == "and" || opcode.as_str() == "actionAll" =>
+                        {
+                            (Some(opcode.as_str()), args)
+                        }
+                        _ => (None, &[]),
+                    };
+                    let mut hoist = 0;
+                    if conj_kind.is_some() {
+                        for arg in conj_args {
+                            let info = self.conj_info(arg);
+                            if info.pure && !info.refs.contains(&opdef.id) {
+                                hoist += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let mut disabled_jumps = Vec::new();
+                    for arg in &conj_args[..hoist] {
+                        self.lower_into(f, arg, dst);
+                        disabled_jumps.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
+                    }
+
                     let bind = f.emit(Op::OneOfBind, cell16, r_set, 0);
-                    self.lower_into(f, body, dst);
+                    match conj_kind {
+                        Some("and") => self.lower_and(f, &conj_args[hoist..], dst),
+                        Some("actionAll") => self.lower_action_all(f, &conj_args[hoist..], dst),
+                        _ => self.lower_into(f, body, dst),
+                    }
                     f.emit(Op::LetExit, cell16, 0, 0);
                     let j_join = f.emit(Op::Jump, 0, 0, 0);
-                    // empty set: this branch is disabled
-                    f.patch_c(bind, f.pc());
+                    // empty set or hoisted guard false: branch disabled
+                    let disabled = f.pc();
+                    f.patch_c(bind, disabled);
+                    for j in disabled_jumps {
+                        f.patch_b(j, disabled);
+                    }
                     self.emit_load_imm(f, dst, Value::bool(false));
                     let join = f.pc();
                     f.patch_b(j_join, join);

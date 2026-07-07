@@ -27,6 +27,32 @@ fn cfg(max_steps: Option<u32>) -> CheckConfig {
         max_steps,
         deadlock: true,
         max_states: None,
+        exact_states: false,
+    }
+}
+
+fn cfg_exact(max_steps: Option<u32>) -> CheckConfig {
+    CheckConfig {
+        exact_states: true,
+        ..cfg(max_steps)
+    }
+}
+
+/// The exact (full-state) mode must agree with the default fingerprint mode.
+#[test]
+fn exact_mode_agrees() {
+    let spec = build("TeachingConcurrency.json", &["correctness"]);
+    match check(&spec, &cfg_exact(None)).map_err(|e| e.error).unwrap() {
+        CheckOutcome::Pass { states, .. } => assert_eq!(states, 439),
+        _ => panic!("expected pass"),
+    }
+    let broken = build("TwoPhaseCommit.json", &["brokenNoAbort"]);
+    match check(&broken, &cfg_exact(Some(2))).map_err(|e| e.error).unwrap() {
+        CheckOutcome::InvariantViolation { invariant, trace } => {
+            assert_eq!(invariant.as_str(), "brokenNoAbort");
+            assert_eq!(trace.len() - 1, 1);
+        }
+        _ => panic!("expected violation"),
     }
 }
 

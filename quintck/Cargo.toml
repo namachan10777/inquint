@@ -11,5 +11,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rustc-hash = { workspace = true }
 hashbrown = { workspace = true }
+foldhash = { workspace = true }
 thiserror = { workspace = true }
 itf = { workspace = true }
