@@ -151,3 +151,9 @@ module dining_naive {
 module bench {
   import dining(N = 12, fixLast = true).*
 }
+
+// Very large instance: 96-entry maps, for persistent-container
+// benchmarks (measured with --max-states as a throughput probe).
+module bench_large {
+  import dining(N = 96, fixLast = true).*
+}

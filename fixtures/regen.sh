@@ -59,6 +59,15 @@ benchgen LamportMutex mutex,requestConsistency
 benchgen Paxos agreement,oneValuePerBallot
 benchgen Raft electionSafety,logMatching,voteIntegrity
 
+# Very large instances (module bench_large): wide maps, used as throughput
+# probes (--max-states) when evaluating container representations.
+largegen() { # largegen <name> <invariants>
+  quint compile --target=json "specs/$1.qnt" --main=bench_large --invariant="$2" \
+    > "fixtures/large_$1.json"
+}
+largegen DiningPhilosophers consistent
+largegen LamportMutex mutex,requestConsistency
+
 # Temporal-property fixtures: compiled with --temporal so the property defs
 # and their dependencies survive flattening. Used by quintck's native
 # temporal checking (specs/check.sh checks the same properties with TLC).

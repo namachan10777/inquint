@@ -210,3 +210,9 @@ module main {
 module bench {
   import lamport_mutex(N = 4, MaxClock = 3).*
 }
+
+// Very large instance: wide clock/req maps, for persistent-container
+// benchmarks (measured with --max-states as a throughput probe).
+module bench_large {
+  import lamport_mutex(N = 48, MaxClock = 2).*
+}

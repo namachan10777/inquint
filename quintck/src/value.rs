@@ -313,9 +313,26 @@ impl ValueStore {
                 rank | ((*n).clamp(LO, HI) - LO) as u64
             }
             ValueData::Str(s) => rank | str_prefix7(s.as_str()),
-            ValueData::Set(es) | ValueData::Tuple(es) | ValueData::List(es) => {
+            ValueData::Tuple(es) => {
+                // Pairs of small ints get an exact lexicographic digest
+                // (28 bits each): tuple keys like (i, j) then never fall
+                // back to the deep compare in map/set probes.
+                const LO2: i64 = -(1 << 27);
+                const HI2: i64 = (1 << 27) - 1;
+                if let [a, b] = &es[..] {
+                    if let (ValueData::Int(x), ValueData::Int(y)) =
+                        (self.entry(*a).data, self.entry(*b).data)
+                    {
+                        if (LO2..=HI2).contains(x) && (LO2..=HI2).contains(y) {
+                            return rank
+                                | (((x - LO2) as u64) << 28)
+                                | ((y - LO2) as u64);
+                        }
+                    }
+                }
                 first_child(es.first())
             }
+            ValueData::Set(es) | ValueData::List(es) => first_child(es.first()),
             ValueData::Record(shape, _) => {
                 rank | shape.fields.first().map_or(0, |f| str_prefix7(f.as_str()))
             }
