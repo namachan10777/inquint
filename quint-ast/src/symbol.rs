@@ -23,12 +23,31 @@ pub struct Symbol(NonZeroU32);
 struct SymbolTable {
     map: FxHashMap<&'static str, Symbol>,
     strs: Vec<&'static str>,
+    /// String-order rank per symbol index; rebuilt lazily after interning
+    /// (the symbol set is essentially frozen once the IR is loaded, so the
+    /// rebuild is amortized to nothing and `Ord` becomes two integer loads).
+    ranks: Vec<u32>,
+    ranks_dirty: bool,
+}
+
+impl SymbolTable {
+    fn rebuild_ranks(&mut self) {
+        let mut order: Vec<u32> = (0..self.strs.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| self.strs[i as usize]);
+        self.ranks.resize(self.strs.len(), 0);
+        for (rank, &i) in order.iter().enumerate() {
+            self.ranks[i as usize] = rank as u32;
+        }
+        self.ranks_dirty = false;
+    }
 }
 
 thread_local! {
     static SYMBOLS: RefCell<SymbolTable> = RefCell::new(SymbolTable {
         map: FxHashMap::default(),
         strs: Vec::new(),
+        ranks: Vec::new(),
+        ranks_dirty: false,
     });
 }
 
@@ -42,6 +61,7 @@ impl Symbol {
             let sym = Symbol(NonZeroU32::new(t.strs.len() as u32 + 1).unwrap());
             t.strs.push(leaked);
             t.map.insert(leaked, sym);
+            t.ranks_dirty = true;
             sym
         })
     }
@@ -83,14 +103,19 @@ impl PartialOrd for Symbol {
 }
 
 /// String order, not id order: keeps name-keyed containers enumerating in
-/// the same order as the old `Arc<str>` representation.
+/// the same order as the old `Arc<str>` representation. Compares via the
+/// cached ranks (no string traversal).
 impl Ord for Symbol {
     fn cmp(&self, other: &Self) -> Ordering {
         if self.0 == other.0 {
-            Ordering::Equal
-        } else {
-            self.as_str().cmp(other.as_str())
+            return Ordering::Equal;
         }
+        SYMBOLS.with_borrow_mut(|t| {
+            if t.ranks_dirty {
+                t.rebuild_ranks();
+            }
+            t.ranks[self.0.get() as usize - 1].cmp(&t.ranks[other.0.get() as usize - 1])
+        })
     }
 }
 

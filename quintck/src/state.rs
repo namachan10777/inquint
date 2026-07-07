@@ -199,6 +199,12 @@ impl VarStorage {
         self.next.iter().map(|reg| reg.get()).collect()
     }
 
+    /// Snapshot into a reused buffer (the VM pools these).
+    pub fn snapshot_next_into(&self, buf: &mut Vec<Option<Value>>) {
+        buf.clear();
+        buf.extend(self.next.iter().map(|reg| reg.get()));
+    }
+
     pub fn restore_next(&self, snapshot: &[Option<Value>]) {
         for (reg, value) in self.next.iter().zip(snapshot.iter()) {
             reg.set(*value);

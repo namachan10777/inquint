@@ -111,10 +111,95 @@ pub struct LambdaVal {
 // ---------------------------------------------------------------------------
 
 struct ValueStore {
-    map: FxHashMap<&'static ValueData, Value>,
+    /// Intern table: stores only ids; hashing/comparison read `entries`.
+    /// Lookups take borrowed slices (see `intern_seq` etc.), so an intern
+    /// *hit* — the common case — allocates nothing.
+    map: hashbrown::HashTable<Value>,
     entries: Vec<&'static ValueData>,
     shapes: FxHashMap<&'static [Symbol], &'static RecordShape>,
     lambdas: Vec<&'static LambdaVal>,
+}
+
+/// Container kinds interned from borrowed slices.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeqKind {
+    Set,
+    Tuple,
+    List,
+    CrossProduct,
+}
+
+// --- canonical hashing -----------------------------------------------------
+// One hash function per logical value, shared by the slice-based lookups
+// and the stored `ValueData` (so both sides of the table agree).
+
+fn hash_seq(kind: SeqKind, elems: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    let tag: u8 = match kind {
+        SeqKind::Set => 3,
+        SeqKind::Tuple => 4,
+        SeqKind::List => 5,
+        SeqKind::CrossProduct => 11,
+    };
+    tag.hash(&mut h);
+    elems.hash(&mut h);
+    h.finish()
+}
+
+fn hash_map_entries(entries: &[(Value, Value)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    7u8.hash(&mut h);
+    entries.hash(&mut h);
+    h.finish()
+}
+
+fn hash_record(shape: &'static RecordShape, values: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    6u8.hash(&mut h);
+    // shapes are interned: the pointer identifies the field list
+    (shape as *const RecordShape as usize).hash(&mut h);
+    values.hash(&mut h);
+    h.finish()
+}
+
+fn hash_data(d: &ValueData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    match d {
+        ValueData::Set(s) => return hash_seq(SeqKind::Set, s),
+        ValueData::Tuple(s) => return hash_seq(SeqKind::Tuple, s),
+        ValueData::List(s) => return hash_seq(SeqKind::List, s),
+        ValueData::CrossProduct(s) => return hash_seq(SeqKind::CrossProduct, s),
+        ValueData::Map(m) => return hash_map_entries(m),
+        ValueData::Record(shape, values) => return hash_record(shape, values),
+        _ => {}
+    }
+    let mut h = rustc_hash::FxHasher::default();
+    discriminant_rank(d).hash(&mut h);
+    match d {
+        ValueData::Bool(b) => b.hash(&mut h),
+        ValueData::Int(n) => n.hash(&mut h),
+        ValueData::Str(s) => s.hash(&mut h),
+        ValueData::Variant(label, v) => {
+            label.hash(&mut h);
+            v.hash(&mut h);
+        }
+        ValueData::Lambda(i) => i.hash(&mut h),
+        ValueData::Interval(a, b) => {
+            a.hash(&mut h);
+            b.hash(&mut h);
+        }
+        ValueData::PowerSet(v) => v.hash(&mut h),
+        ValueData::MapSet(a, b) => {
+            a.hash(&mut h);
+            b.hash(&mut h);
+        }
+        ValueData::InfiniteInt | ValueData::InfiniteNat => {}
+        _ => unreachable!("containers handled above"),
+    }
+    h.finish()
 }
 
 // Reserved ids, in ValueStore::new interning order.
@@ -124,10 +209,14 @@ const SMALL_INT_MIN: i64 = -1024;
 const SMALL_INT_MAX: i64 = 1023;
 const INT_BASE: u32 = 3; // id of SMALL_INT_MIN
 
+/// Ids of symbolic set forms carry this tag bit, so `is_symbolic` (and the
+/// `normalize` fast path, hit on every assignment) needs no store access.
+const SYMBOLIC_BIT: u32 = 1 << 31;
+
 impl ValueStore {
     fn new() -> Self {
         let mut store = ValueStore {
-            map: FxHashMap::default(),
+            map: hashbrown::HashTable::new(),
             entries: Vec::new(),
             shapes: FxHashMap::default(),
             lambdas: Vec::new(),
@@ -142,15 +231,78 @@ impl ValueStore {
         store
     }
 
+    /// Register a freshly interned node under a precomputed hash.
+    fn insert_new(&mut self, hash: u64, data: ValueData) -> Value {
+        let symbolic = data.is_symbolic();
+        let leaked: &'static ValueData = Box::leak(Box::new(data));
+        let index = self.entries.len() as u32 + 1;
+        assert!(index < SYMBOLIC_BIT, "value store overflow");
+        let bits = if symbolic { index | SYMBOLIC_BIT } else { index };
+        let id = Value(NonZeroU32::new(bits).unwrap());
+        self.entries.push(leaked);
+        let entries = &self.entries;
+        self.map
+            .insert_unique(hash, id, |&v| hash_data(entries[v.index()]));
+        id
+    }
+
     fn intern(&mut self, data: ValueData) -> Value {
-        if let Some(&id) = self.map.get(&data) {
+        let hash = hash_data(&data);
+        let entries = &self.entries;
+        if let Some(&id) = self.map.find(hash, |&v| *entries[v.index()] == data) {
             return id;
         }
-        let leaked: &'static ValueData = Box::leak(Box::new(data));
-        let id = Value(NonZeroU32::new(self.entries.len() as u32 + 1).expect("id overflow"));
-        self.entries.push(leaked);
-        self.map.insert(leaked, id);
-        id
+        self.insert_new(hash, data)
+    }
+
+    /// Intern a sequence container from a borrowed slice: nothing is
+    /// allocated on a hit.
+    fn intern_seq(&mut self, kind: SeqKind, elems: &[Value]) -> Value {
+        let hash = hash_seq(kind, elems);
+        let entries = &self.entries;
+        let found = self.map.find(hash, |&v| match (kind, entries[v.index()]) {
+            (SeqKind::Set, ValueData::Set(s)) => &**s == elems,
+            (SeqKind::Tuple, ValueData::Tuple(s)) => &**s == elems,
+            (SeqKind::List, ValueData::List(s)) => &**s == elems,
+            (SeqKind::CrossProduct, ValueData::CrossProduct(s)) => &**s == elems,
+            _ => false,
+        });
+        if let Some(&id) = found {
+            return id;
+        }
+        let data = match kind {
+            SeqKind::Set => ValueData::Set(elems.into()),
+            SeqKind::Tuple => ValueData::Tuple(elems.into()),
+            SeqKind::List => ValueData::List(elems.into()),
+            SeqKind::CrossProduct => ValueData::CrossProduct(elems.into()),
+        };
+        self.insert_new(hash, data)
+    }
+
+    fn intern_map(&mut self, pairs: &[(Value, Value)]) -> Value {
+        let hash = hash_map_entries(pairs);
+        let entries = &self.entries;
+        let found = self.map.find(hash, |&v| match entries[v.index()] {
+            ValueData::Map(m) => &**m == pairs,
+            _ => false,
+        });
+        if let Some(&id) = found {
+            return id;
+        }
+        self.insert_new(hash, ValueData::Map(pairs.into()))
+    }
+
+    fn intern_record(&mut self, shape: &'static RecordShape, values: &[Value]) -> Value {
+        let hash = hash_record(shape, values);
+        let entries = &self.entries;
+        let found = self.map.find(hash, |&v| match entries[v.index()] {
+            ValueData::Record(s, vs) => std::ptr::eq(*s, shape) && &**vs == values,
+            _ => false,
+        });
+        if let Some(&id) = found {
+            return id;
+        }
+        self.insert_new(hash, ValueData::Record(shape, values.into()))
     }
 
     fn shape(&mut self, fields: &[Symbol]) -> &'static RecordShape {
@@ -173,6 +325,142 @@ fn intern(data: ValueData) -> Value {
     VALUES.with_borrow_mut(|s| s.intern(data))
 }
 
+fn intern_seq(kind: SeqKind, elems: &[Value]) -> Value {
+    VALUES.with_borrow_mut(|s| s.intern_seq(kind, elems))
+}
+
+// ---------------------------------------------------------------------------
+// Small stack buffers: constructor operands and pick indices live on the
+// stack for the common small arities, so an intern hit allocates nothing.
+// ---------------------------------------------------------------------------
+
+/// Inline-first buffer of values (spills to a `Vec` beyond 16).
+pub enum ValueBuf {
+    Inline([Value; 16], usize),
+    Spill(Vec<Value>),
+}
+
+impl ValueBuf {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        ValueBuf::Inline([Value::bool(false); 16], 0)
+    }
+
+    pub fn from_slice(s: &[Value]) -> Self {
+        let mut buf = ValueBuf::new();
+        for &v in s {
+            buf.push(v);
+        }
+        buf
+    }
+
+    pub fn push(&mut self, v: Value) {
+        match self {
+            ValueBuf::Inline(buf, len) => {
+                if *len < buf.len() {
+                    buf[*len] = v;
+                    *len += 1;
+                } else {
+                    let mut vec = buf.to_vec();
+                    vec.push(v);
+                    *self = ValueBuf::Spill(vec);
+                }
+            }
+            ValueBuf::Spill(vec) => vec.push(v),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[Value] {
+        match self {
+            ValueBuf::Inline(buf, len) => &buf[..*len],
+            ValueBuf::Spill(vec) => vec,
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [Value] {
+        match self {
+            ValueBuf::Inline(buf, len) => &mut buf[..*len],
+            ValueBuf::Spill(vec) => vec,
+        }
+    }
+
+    fn truncate(&mut self, n: usize) {
+        match self {
+            ValueBuf::Inline(_, len) => *len = n.min(*len),
+            ValueBuf::Spill(vec) => vec.truncate(n),
+        }
+    }
+
+    /// Sort by [`value_cmp`] and drop duplicates (equal ⇔ same id).
+    fn sort_dedup(&mut self) {
+        let s = self.as_mut_slice();
+        s.sort_unstable_by(|a, b| value_cmp(*a, *b));
+        let mut w = 0;
+        for r in 0..s.len() {
+            if w == 0 || s[r] != s[w - 1] {
+                s[w] = s[r];
+                w += 1;
+            }
+        }
+        self.truncate(w);
+    }
+}
+
+/// Inline-first buffer of `u64` (pick bounds / choice indices; spills
+/// beyond 8 — only deep `setOfMaps` nesting needs that).
+pub enum U64Buf {
+    Inline([u64; 8], usize),
+    Spill(Vec<u64>),
+}
+
+impl U64Buf {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        U64Buf::Inline([0; 8], 0)
+    }
+
+    pub fn push(&mut self, v: u64) {
+        match self {
+            U64Buf::Inline(buf, len) => {
+                if *len < buf.len() {
+                    buf[*len] = v;
+                    *len += 1;
+                } else {
+                    let mut vec = buf.to_vec();
+                    vec.push(v);
+                    *self = U64Buf::Spill(vec);
+                }
+            }
+            U64Buf::Spill(vec) => vec.push(v),
+        }
+    }
+
+    pub fn zeros(n: usize) -> Self {
+        if n <= 8 {
+            U64Buf::Inline([0; 8], n)
+        } else {
+            U64Buf::Spill(vec![0; n])
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u64] {
+        match self {
+            U64Buf::Inline(buf, len) => &mut buf[..*len],
+            U64Buf::Spill(vec) => vec,
+        }
+    }
+}
+
+impl std::ops::Deref for U64Buf {
+    type Target = [u64];
+    fn deref(&self) -> &[u64] {
+        match self {
+            U64Buf::Inline(buf, len) => &buf[..*len],
+            U64Buf::Spill(vec) => vec,
+        }
+    }
+}
+
 fn intern_shape(fields: &[Symbol]) -> &'static RecordShape {
     VALUES.with_borrow_mut(|s| s.shape(fields))
 }
@@ -183,10 +471,15 @@ pub fn store_len() -> usize {
 }
 
 impl Value {
+    #[inline]
+    fn index(self) -> usize {
+        (self.0.get() & !SYMBOLIC_BIT) as usize - 1
+    }
+
     /// The interned node. `&'static`: the store is append-only and leaked.
     #[inline]
     pub fn data(self) -> &'static ValueData {
-        VALUES.with_borrow(|s| s.entries[self.0.get() as usize - 1])
+        VALUES.with_borrow(|s| s.entries[self.index()])
     }
 
     /// Raw id bits, for embedding in bytecode immediates.
@@ -202,10 +495,11 @@ impl Value {
     }
 
     pub fn as_lambda(self) -> &'static LambdaVal {
-        match self.data() {
-            ValueData::Lambda(i) => VALUES.with_borrow(|s| s.lambdas[*i as usize]),
+        // single store access for data + registry
+        VALUES.with_borrow(|s| match s.entries[self.index()] {
+            ValueData::Lambda(i) => s.lambdas[*i as usize],
             v => panic!("expected lambda, got {v:?}"),
-        }
+        })
     }
 }
 
@@ -259,6 +553,17 @@ impl ValueData {
 /// Symbolic forms and lambdas must never be ordered (they never enter
 /// containers); doing so is a bug. Hash-consing gives `Equal ⇔ same id`, so
 /// comparison never recurses into equal subtrees.
+/// Guard for early returns out of [`value_cmp`]: distinct ids must never
+/// compare Equal (hash-consing invariant).
+#[inline]
+fn finish_cmp(ord: Ordering) -> Ordering {
+    debug_assert!(
+        ord != Ordering::Equal,
+        "distinct ids compared equal: hash-consing invariant broken"
+    );
+    ord
+}
+
 pub fn value_cmp(a: Value, b: Value) -> Ordering {
     if a == b {
         return Ordering::Equal;
@@ -272,6 +577,11 @@ pub fn value_cmp(a: Value, b: Value) -> Ordering {
         (ValueData::Tuple(x), ValueData::Tuple(y)) => cmp_slices(x, y),
         (ValueData::List(x), ValueData::List(y)) => cmp_slices(x, y),
         (ValueData::Record(sa, va), ValueData::Record(sb, vb)) => {
+            // Same interned shape (the common case): every key pair compares
+            // Equal, so the interleaved order reduces to the value slices.
+            if std::ptr::eq(*sa, *sb) {
+                return finish_cmp(cmp_slices(va, vb));
+            }
             // Field-interleaved comparison, matching BTreeMap<QuintName, Value> order.
             let mut it_a = sa.fields.iter().zip(va.iter());
             let mut it_b = sb.fields.iter().zip(vb.iter());
@@ -317,11 +627,7 @@ pub fn value_cmp(a: Value, b: Value) -> Ordering {
         }
         _ => discriminant_rank(da).cmp(&discriminant_rank(db)),
     };
-    debug_assert!(
-        ord != Ordering::Equal,
-        "distinct ids compared equal: hash-consing invariant broken"
-    );
-    ord
+    finish_cmp(ord)
 }
 
 fn cmp_slices(a: &[Value], b: &[Value]) -> Ordering {
@@ -360,44 +666,45 @@ impl Value {
     }
 
     pub fn set(elems: impl IntoIterator<Item = Value>) -> Result<Self, QuintError> {
-        let elems = elems
-            .into_iter()
-            .map(|v| v.normalize())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::set_of_normalized(elems))
+        let mut buf = ValueBuf::new();
+        for v in elems {
+            buf.push(v.normalize()?);
+        }
+        buf.sort_dedup();
+        Ok(intern_seq(SeqKind::Set, buf.as_slice()))
     }
 
     /// Set from already-normalized elements (sorts and dedups).
     pub fn set_of_normalized(mut elems: Vec<Value>) -> Self {
         elems.sort_unstable_by(|a, b| value_cmp(*a, *b));
         elems.dedup();
-        intern(ValueData::Set(elems.into_boxed_slice()))
+        intern_seq(SeqKind::Set, &elems)
     }
 
     /// Set from elements already sorted by [`value_cmp`] with no duplicates.
     pub fn set_sorted(elems: Vec<Value>) -> Self {
         debug_assert!(elems.windows(2).all(|w| value_cmp(w[0], w[1]) == Ordering::Less));
-        intern(ValueData::Set(elems.into_boxed_slice()))
+        intern_seq(SeqKind::Set, &elems)
     }
 
     pub fn tuple(elems: impl IntoIterator<Item = Value>) -> Result<Self, QuintError> {
-        let vs = elems
-            .into_iter()
-            .map(|v| v.normalize())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(intern(ValueData::Tuple(vs.into_boxed_slice())))
+        let mut buf = ValueBuf::new();
+        for v in elems {
+            buf.push(v.normalize()?);
+        }
+        Ok(intern_seq(SeqKind::Tuple, buf.as_slice()))
     }
 
     pub fn list(elems: impl IntoIterator<Item = Value>) -> Result<Self, QuintError> {
-        let vs = elems
-            .into_iter()
-            .map(|v| v.normalize())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::list_of_normalized(vs))
+        let mut buf = ValueBuf::new();
+        for v in elems {
+            buf.push(v.normalize()?);
+        }
+        Ok(intern_seq(SeqKind::List, buf.as_slice()))
     }
 
     pub fn list_of_normalized(vs: Vec<Value>) -> Self {
-        intern(ValueData::List(vs.into_boxed_slice()))
+        intern_seq(SeqKind::List, &vs)
     }
 
     pub fn record(
@@ -419,14 +726,17 @@ impl Value {
             }
         });
         let shape = intern_shape(&fs.iter().map(|(k, _)| *k).collect::<Vec<_>>());
-        let values: Box<[Value]> = fs.into_iter().map(|(_, v)| v).collect();
-        Ok(intern(ValueData::Record(shape, values)))
+        let mut values = ValueBuf::new();
+        for (_, v) in fs {
+            values.push(v);
+        }
+        Ok(Self::record_shaped(shape, values.as_slice()))
     }
 
     /// Record with a known shape and values in shape order (all normalized).
-    pub fn record_shaped(shape: &'static RecordShape, values: Box<[Value]>) -> Self {
+    pub fn record_shaped(shape: &'static RecordShape, values: &[Value]) -> Self {
         debug_assert_eq!(shape.fields.len(), values.len());
-        intern(ValueData::Record(shape, values))
+        VALUES.with_borrow_mut(|s| s.intern_record(shape, values))
     }
 
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Result<Self, QuintError> {
@@ -449,7 +759,7 @@ impl Value {
                 false
             }
         });
-        intern(ValueData::Map(entries.into_boxed_slice()))
+        VALUES.with_borrow_mut(|s| s.intern_map(&entries))
     }
 
     /// Map from pairs already sorted by key with unique keys.
@@ -457,7 +767,7 @@ impl Value {
         debug_assert!(entries
             .windows(2)
             .all(|w| value_cmp(w[0].0, w[1].0) == Ordering::Less));
-        intern(ValueData::Map(entries.into_boxed_slice()))
+        VALUES.with_borrow_mut(|s| s.intern_map(&entries))
     }
 
     pub fn variant(label: QuintName, payload: Value) -> Result<Self, QuintError> {
@@ -478,7 +788,7 @@ impl Value {
     }
 
     pub fn cross_product(sets: Vec<Value>) -> Self {
-        intern(ValueData::CrossProduct(sets.into_boxed_slice()))
+        intern_seq(SeqKind::CrossProduct, &sets)
     }
 
     pub fn power_set(base: Value) -> Self {
@@ -510,10 +820,14 @@ impl Value {
         }
     }
 
+    /// Bools have reserved ids: no store access on the hot path
+    /// (`JumpIfFalse` is the most frequent instruction).
+    #[inline]
     pub fn as_bool(self) -> bool {
-        match self.data() {
-            ValueData::Bool(b) => *b,
-            v => panic!("expected bool, got {v:?}"),
+        match self.0.get() {
+            TRUE_ID => true,
+            FALSE_ID => false,
+            _ => panic!("expected bool, got {:?}", self.data()),
         }
     }
 
@@ -568,8 +882,10 @@ impl Value {
         }
     }
 
+    /// Tag-bit test: no store access (see [`SYMBOLIC_BIT`]).
+    #[inline]
     pub fn is_symbolic(self) -> bool {
-        self.data().is_symbolic()
+        self.0.get() & SYMBOLIC_BIT != 0
     }
 
     pub fn is_set(self) -> bool {
@@ -729,7 +1045,8 @@ impl Value {
                 }
                 let mut out = Vec::with_capacity(n as usize);
                 let bounds = self.bounds()?;
-                let mut indices = vec![0u64; bounds.len()];
+                let mut indices = U64Buf::zeros(bounds.len());
+                let indices = indices.as_mut_slice();
                 'outer: loop {
                     out.push(self.pick(&mut indices.iter().copied())?.normalize()?);
                     // mixed-radix increment
@@ -754,15 +1071,23 @@ impl Value {
     }
 
     /// The mixed-radix bounds for indexed access (`pick`). One entry per
-    /// independent index dimension.
-    pub fn bounds(self) -> Result<Vec<u64>, QuintError> {
-        Ok(match self.data() {
-            ValueData::Set(s) => vec![s.len() as u64],
-            ValueData::Interval(_, _) => vec![self.cardinality()?],
-            ValueData::CrossProduct(sets) => sets
-                .iter()
-                .map(|s| s.cardinality())
-                .collect::<Result<Vec<_>, _>>()?,
+    /// independent index dimension. Stack-allocated for the common case
+    /// (one dimension) — this runs on every `oneOf` choice.
+    pub fn bounds(self) -> Result<U64Buf, QuintError> {
+        let mut out = U64Buf::new();
+        self.bounds_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn bounds_into(self, out: &mut U64Buf) -> Result<(), QuintError> {
+        match self.data() {
+            ValueData::Set(s) => out.push(s.len() as u64),
+            ValueData::Interval(_, _) => out.push(self.cardinality()?),
+            ValueData::CrossProduct(sets) => {
+                for s in sets.iter() {
+                    out.push(s.cardinality()?);
+                }
+            }
             ValueData::PowerSet(base) => {
                 let n = base.cardinality()?;
                 if n >= 63 {
@@ -770,17 +1095,23 @@ impl Value {
                         "powerset of a {n}-element set (2^{n} elements)"
                     )));
                 }
-                vec![1u64 << n]
+                out.push(1u64 << n);
             }
             ValueData::MapSet(domain, range) => {
                 let d = domain.cardinality()? as usize;
-                let range_bounds = range.bounds()?;
-                range_bounds.repeat(d)
+                let mut range_bounds = U64Buf::new();
+                range.bounds_into(&mut range_bounds)?;
+                for _ in 0..d {
+                    for &b in range_bounds.iter() {
+                        out.push(b);
+                    }
+                }
             }
             ValueData::InfiniteInt => return Err(unsupported("picking from infinite set Int")),
             ValueData::InfiniteNat => return Err(unsupported("picking from infinite set Nat")),
             v => panic!("bounds: not a set: {v:?}"),
-        })
+        }
+        Ok(())
     }
 
     /// Pick the element identified by `indexes` (one index per bound, in
@@ -840,7 +1171,8 @@ impl Value {
 
     /// Canonical form: symbolic set forms are materialized (recursively).
     /// Values built from containers are already canonical, so this is a
-    /// no-op in the common case.
+    /// tag-bit test in the common case.
+    #[inline]
     pub fn normalize(self) -> Result<Value, QuintError> {
         if self.is_symbolic() {
             Ok(Value::set_sorted(self.enumerate()?.into_owned()))

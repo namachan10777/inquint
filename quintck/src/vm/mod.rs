@@ -29,7 +29,7 @@ pub use lower::Lowerer;
 use crate::error::{unsupported, QuintError};
 use crate::eval::Env;
 use crate::state::Register;
-use crate::value::{EvalResult, Value};
+use crate::value::{EvalResult, U64Buf, Value};
 use builtins::VmBuiltin;
 use quint_ast::{QuintId, Symbol};
 use std::rc::Rc;
@@ -162,7 +162,12 @@ struct AnyRec {
 
 pub struct Vm {
     pub program: Program,
+    /// Register file, high-water-mark managed: `reg_top` is the logical
+    /// stack cursor; slots above it keep stale values (lowering guarantees
+    /// every register is written before it is read), so call frames never
+    /// memset.
     regs: Vec<Value>,
+    reg_top: usize,
     let_cells: Vec<Option<EvalResult>>,
     val_cells: Vec<(u64, Value)>,
     pure_cells: Vec<Option<Value>>,
@@ -172,6 +177,8 @@ pub struct Vm {
     snapshots: Vec<Vec<Option<Value>>>,
     any_stack: Vec<AnyRec>,
     next_stack: Vec<bool>,
+    /// Retired snapshot buffers, reused by SnapNext/AnyBegin.
+    snap_pool: Vec<Vec<Option<Value>>>,
 }
 
 /// Callee parameter counts are bounded so call frames can save the old
@@ -192,6 +199,7 @@ impl Vm {
         Vm {
             program,
             regs: Vec::new(),
+            reg_top: 0,
             let_cells: Vec::new(),
             val_cells: Vec::new(),
             pure_cells: Vec::new(),
@@ -200,7 +208,20 @@ impl Vm {
             snapshots: Vec::new(),
             any_stack: Vec::new(),
             next_stack: Vec::new(),
+            snap_pool: Vec::new(),
         }
+    }
+
+    /// Push a pooled snapshot of the next-state registers.
+    fn push_snapshot(&mut self, env: &Env) {
+        let mut buf = self.snap_pool.pop().unwrap_or_default();
+        env.storage.borrow().snapshot_next_into(&mut buf);
+        self.snapshots.push(buf);
+    }
+
+    fn pop_snapshot(&mut self) {
+        let buf = self.snapshots.pop().expect("unbalanced snapshot pop");
+        self.snap_pool.push(buf);
     }
 
     pub(crate) fn add_let_cell(&mut self) -> u32 {
@@ -228,7 +249,7 @@ impl Vm {
             snaps: self.snapshots.len(),
             anys: self.any_stack.len(),
             nexts: self.next_stack.len(),
-            regs: self.regs.len(),
+            regs: self.reg_top,
         };
         let result = self.exec(env, entry);
         if result.is_err() {
@@ -252,22 +273,30 @@ impl Vm {
             let (slot, old) = self.param_stack.pop().unwrap();
             self.program.params[slot as usize].set(old);
         }
-        self.snapshots.truncate(m.snaps);
+        while self.snapshots.len() > m.snaps {
+            self.pop_snapshot();
+        }
         self.any_stack.truncate(m.anys);
         while self.next_stack.len() > m.nexts {
             env.next_mode = self.next_stack.pop().unwrap();
         }
-        self.regs.truncate(m.regs);
+        self.reg_top = m.regs;
     }
 
-    /// Execute one function in a fresh register window (native recursion,
-    /// like the closure engine's nested calls).
+    /// Execute one function in a fresh register window (native recursion).
+    /// The window is not cleared: the file only grows to the high-water
+    /// mark, and stale values are fine because lowering writes every
+    /// register before reading it.
     fn exec(&mut self, env: &mut Env, fnid: FnId) -> EvalResult {
         let chunk = self.program.funcs[fnid as usize].clone();
-        let base = self.regs.len();
-        self.regs.resize(base + chunk.nregs as usize, Value::bool(false));
+        let base = self.reg_top;
+        let top = base + chunk.nregs as usize;
+        if self.regs.len() < top {
+            self.regs.resize(top, Value::bool(false));
+        }
+        self.reg_top = top;
         let result = self.exec_in(env, &chunk, base);
-        self.regs.truncate(base);
+        self.reg_top = base;
         result
     }
 
@@ -474,9 +503,9 @@ impl Vm {
                 Op::OneOfBind => {
                     let set = reg!(ins.b);
                     let bounds = try_at!(pc, set.bounds());
-                    let mut indices = Vec::with_capacity(bounds.len());
+                    let mut indices = U64Buf::new();
                     let mut empty = false;
-                    for bound in bounds {
+                    for &bound in bounds.iter() {
                         match try_at!(pc, env.choose(bound)) {
                             Some(i) => indices.push(i),
                             None => {
@@ -491,7 +520,7 @@ impl Vm {
                     } else {
                         let picked = try_at!(
                             pc,
-                            set.pick(&mut indices.into_iter()).and_then(|v| v.normalize())
+                            set.pick(&mut indices.iter().copied()).and_then(|v| v.normalize())
                         );
                         let cell = ins.a as usize;
                         let old = self.let_cells[cell].replace(Ok(picked));
@@ -501,8 +530,8 @@ impl Vm {
                 Op::OneOfPick => {
                     let set = reg!(ins.b);
                     let bounds = try_at!(pc, set.bounds());
-                    let mut indices = Vec::with_capacity(bounds.len());
-                    for bound in bounds {
+                    let mut indices = U64Buf::new();
+                    for &bound in bounds.iter() {
                         match try_at!(pc, env.choose(bound)) {
                             Some(i) => indices.push(i),
                             None => fail!(
@@ -511,7 +540,7 @@ impl Vm {
                             ),
                         }
                     }
-                    reg!(ins.a) = try_at!(pc, set.pick(&mut indices.into_iter()));
+                    reg!(ins.a) = try_at!(pc, set.pick(&mut indices.iter().copied()));
                 }
                 Op::AnyBegin => {
                     let table = &chunk.branch_tables[ins.b as usize];
@@ -522,8 +551,7 @@ impl Vm {
                             pc = ins.c as usize;
                         }
                         Some(start) => {
-                            self.snapshots
-                                .push(env.storage.borrow().snapshot_next());
+                            self.push_snapshot(env);
                             self.any_stack.push(AnyRec {
                                 start,
                                 tried: 0,
@@ -545,7 +573,7 @@ impl Vm {
                     let table = &chunk.branch_tables[table_idx as usize];
                     let n = table.len();
                     if reg!(ins.a).as_bool() {
-                        self.snapshots.pop();
+                        self.pop_snapshot();
                         self.any_stack.pop();
                         pc = join_pc as usize;
                     } else {
@@ -559,7 +587,7 @@ impl Vm {
                             let branch = (start as usize + tried) % n;
                             pc = table[branch] as usize;
                         } else {
-                            self.snapshots.pop();
+                            self.pop_snapshot();
                             self.any_stack.pop();
                             reg!(ins.a) = Value::bool(false);
                             pc = join_pc as usize;
@@ -610,14 +638,15 @@ impl Vm {
                     }
                 }
                 Op::SnapNext => {
-                    self.snapshots.push(env.storage.borrow().snapshot_next());
+                    self.push_snapshot(env);
                 }
                 Op::RestoreSnapPop => {
                     let snap = self.snapshots.pop().expect("unbalanced RestoreSnapPop");
                     env.storage.borrow().restore_next(&snap);
+                    self.snap_pool.push(snap);
                 }
                 Op::DropSnap => {
-                    self.snapshots.pop().expect("unbalanced DropSnap");
+                    self.pop_snapshot();
                 }
                 Op::Reps => {
                     let reps = reg!(ins.b).as_int();

@@ -4,6 +4,12 @@
 //! in particular the **emit order equals the closure engine's evaluation
 //! order**, which is what keeps `ChoiceCtl` replay deterministic across
 //! engines (see `choice.rs`). Do not reorder operand lowering.
+//!
+//! Register discipline: **every register is written before it is read, on
+//! every control path** — `lower_into` always writes `dst`, argument blocks
+//! are filled before `Call`/`Builtin`, and every jump target reading a
+//! register is dominated by a write to it. The VM relies on this to reuse
+//! register-file slots without clearing them between calls.
 
 use super::builtins::vm_builtin;
 use super::{BuiltinCall, Chunk, FnId, Instr, MatchTable, Op, Program, Vm};

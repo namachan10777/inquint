@@ -180,9 +180,9 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
                 .iter()
                 .position(|&f| f == field)
                 .expect("with: no such field (type checker bug?)");
-            let mut out: Box<[Value]> = values.into();
-            out[i] = args[2].normalize()?;
-            Ok(Value::record_shaped(shape, out))
+            let mut out = crate::value::ValueBuf::from_slice(values);
+            out.as_mut_slice()[i] = args[2].normalize()?;
+            Ok(Value::record_shaped(shape, out.as_slice()))
         },
         "powerset" => |_, args| Ok(Value::power_set(args[0])),
         "contains" => |_, args| Ok(Value::bool(args[0].contains(args[1].normalize()?)?)),
