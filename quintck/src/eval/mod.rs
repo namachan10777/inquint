@@ -27,9 +27,33 @@ pub struct Env {
     /// The choice oracle. `None` during invariant evaluation, where any
     /// nondeterminism is an error.
     pub choices: Option<Rc<RefCell<ChoiceCtl>>>,
+    /// When true, state-variable reads take the `next` register bank —
+    /// this is how `next(x)` is evaluated inside temporal edge atoms.
+    pub next_mode: bool,
+    /// `next(...)` is only legal while evaluating a temporal edge atom.
+    pub next_allowed: bool,
+    /// Run-test mode: `any` falls through to the next enabled branch when
+    /// the chosen one is disabled (quint's "choose among enabled"
+    /// semantics). The model checker keeps disabled picks as cheap failed
+    /// paths instead — the successor sets are identical either way, but
+    /// fail-fast is significantly faster on specs with many guards.
+    pub any_fallthrough: bool,
 }
 
 impl Env {
+    pub fn new(
+        storage: Rc<RefCell<VarStorage>>,
+        choices: Option<Rc<RefCell<ChoiceCtl>>>,
+    ) -> Self {
+        Env {
+            storage,
+            choices,
+            next_mode: false,
+            next_allowed: false,
+            any_fallthrough: false,
+        }
+    }
+
     /// Make a choice among `bound` alternatives, or fail if nondeterminism
     /// is not allowed in this context. `Ok(None)` means the choice is empty
     /// (branch disabled).
@@ -61,6 +85,38 @@ impl CompiledExpr {
 impl fmt::Debug for CompiledExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<compiled>")
+    }
+}
+
+/// A compiled expression plus captured values for quantifier-bound
+/// parameters (used by temporal atoms instantiated under `Set.forall`).
+/// Evaluation sets the shared param registers around the call.
+#[derive(Clone)]
+pub struct BoundExpr {
+    pub expr: CompiledExpr,
+    pub bindings: Vec<(Rc<RefCell<Option<Value>>>, Value)>,
+}
+
+impl BoundExpr {
+    pub fn eval(&self, env: &mut Env) -> EvalResult {
+        let saved = self.set_bindings();
+        let result = self.expr.execute(env);
+        self.restore_bindings(saved);
+        result
+    }
+
+    /// Install the captured bindings; returns the previous register values.
+    pub fn set_bindings(&self) -> Vec<Option<Value>> {
+        self.bindings
+            .iter()
+            .map(|(reg, value)| reg.replace(Some(value.clone())))
+            .collect()
+    }
+
+    pub fn restore_bindings(&self, saved: Vec<Option<Value>>) {
+        for ((reg, _), old) in self.bindings.iter().zip(saved) {
+            *reg.borrow_mut() = old;
+        }
     }
 }
 

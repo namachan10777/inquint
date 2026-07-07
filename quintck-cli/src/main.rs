@@ -52,24 +52,26 @@ struct Cli {
     #[arg(long)]
     out_itf: Option<PathBuf>,
 
-    /// Temporal properties (not supported in v1; fails immediately)
-    #[arg(long)]
-    temporal: Option<String>,
+    /// Temporal properties to check, comma-separated
+    #[arg(long, value_delimiter = ',')]
+    temporal: Vec<String>,
+
+    /// Execute `run` test definitions instead of model checking.
+    /// Optionally pass test names; all runs execute by default.
+    /// Every path through a run's nondeterminism must pass.
+    #[arg(long, num_args = 0.., value_delimiter = ',')]
+    test: Option<Vec<String>>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    if cli.temporal.is_some() {
-        eprintln!("error: temporal properties are not supported by quintck v1");
-        return ExitCode::from(2);
-    }
 
     let opts = compile::QntOptions {
         main: cli.main.as_deref(),
         init: cli.init.as_deref(),
         step: cli.step.as_deref(),
         invariants: &cli.invariant,
+        temporal: &cli.temporal,
     };
     let json = match compile::load_input(&cli.input, &opts) {
         Ok(json) => json,
@@ -87,10 +89,39 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(test_names) = &cli.test {
+        return match quintck::runner::run_tests(&output, test_names) {
+            Ok(reports) => {
+                let mut failed = 0;
+                for report in &reports {
+                    match &report.result {
+                        Ok(paths) => println!("    ok {} ({paths} paths)", report.name),
+                        Err(e) => {
+                            println!("    failed {}: {e}", report.name);
+                            failed += 1;
+                        }
+                    }
+                }
+                if failed == 0 {
+                    println!("[ok] {} test(s) passed", reports.len());
+                    ExitCode::SUCCESS
+                } else {
+                    println!("[violation] {failed} of {} test(s) failed", reports.len());
+                    ExitCode::from(1)
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
     let entry = EntryPoints {
         init: cli.init,
         step: cli.step,
         invariants: cli.invariant,
+        temporal: cli.temporal.clone(),
     };
 
     let spec = match CompiledSpec::build(&output, &entry) {
@@ -134,6 +165,87 @@ fn main() -> ExitCode {
             }
         }
     };
+
+    if !spec.temporal.is_empty() {
+        use quintck::temporal::{check_temporal, TemporalOutcome};
+        if cfg.max_steps.is_some() {
+            eprintln!("warning: temporal checking requires exhaustive exploration; ignoring --max-steps");
+        }
+        let tcfg = CheckConfig {
+            max_steps: None,
+            ..cfg
+        };
+        return match check_temporal(&spec, &tcfg) {
+            Ok(TemporalOutcome::Pass { states }) => {
+                println!("[ok] {states} states explored, temporal properties hold");
+                ExitCode::SUCCESS
+            }
+            Ok(TemporalOutcome::SafetyViolation { property, trace }) => {
+                print_trace(&trace);
+                write_itf(&trace, true);
+                println!(
+                    "[violation] temporal property '{property}' violated at depth {}",
+                    trace.len() - 1
+                );
+                ExitCode::from(1)
+            }
+            Ok(TemporalOutcome::Violation { property, lasso }) => {
+                for (i, state) in lasso.states.iter().enumerate() {
+                    if i == lasso.loop_index {
+                        eprintln!("──── loop starts here ────");
+                    }
+                    eprintln!("State {i}:");
+                    for (name, value) in spec.vars.names.iter().zip(state.iter()) {
+                        eprintln!("  {name} = {value}");
+                    }
+                }
+                if let Some(path) = &cli.out_itf {
+                    let mut itf = quintck::itf_out::trace_to_itf(
+                        &spec.vars.names,
+                        &lasso.states,
+                        true,
+                        &source,
+                    );
+                    itf.loop_index = Some(lasso.loop_index as u64);
+                    if let Ok(json) = serde_json::to_string_pretty(&itf) {
+                        let _ = std::fs::write(path, json);
+                    }
+                }
+                println!(
+                    "[violation] temporal property '{property}' violated (lasso: {} prefix + {} loop states)",
+                    lasso.loop_index,
+                    lasso.states.len() - lasso.loop_index
+                );
+                ExitCode::from(1)
+            }
+            Ok(TemporalOutcome::InvariantViolation { invariant, trace }) => {
+                print_trace(&trace);
+                write_itf(&trace, true);
+                println!(
+                    "[violation] invariant '{invariant}' violated at depth {}",
+                    trace.len() - 1
+                );
+                ExitCode::from(1)
+            }
+            Ok(TemporalOutcome::Deadlock { trace }) => {
+                print_trace(&trace);
+                write_itf(&trace, true);
+                println!("[violation] deadlock reached at depth {}", trace.len() - 1);
+                ExitCode::from(1)
+            }
+            Ok(TemporalOutcome::Incomplete { states }) => {
+                eprintln!("stopped after {states} states (max-states); no verdict");
+                ExitCode::from(2)
+            }
+            Err(e) => {
+                if !e.trace.is_empty() {
+                    print_trace(&e.trace);
+                }
+                eprintln!("error: {}", e.error);
+                ExitCode::from(2)
+            }
+        };
+    }
 
     match check(&spec, &cfg) {
         Ok(CheckOutcome::Pass { states, max_depth }) => {

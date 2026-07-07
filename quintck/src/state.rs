@@ -104,6 +104,33 @@ impl VarStorage {
         }
     }
 
+    /// Commit the next state: move assigned next-registers into current
+    /// (unassigned variables keep their current value) and clear the
+    /// per-state caches. Used by the run-test operators (`then`, `reps`).
+    pub fn shift(&self) {
+        for (cur, next) in self.current.iter().zip(self.next.iter()) {
+            if let Some(v) = next.borrow_mut().take() {
+                *cur.borrow_mut() = Some(v);
+            }
+        }
+        self.clear_caches();
+    }
+
+    /// The raw next-register contents after an action run: `None` for
+    /// variables the action did not assign (unconstrained in TLA terms).
+    pub fn take_partial(&self) -> Vec<Option<Value>> {
+        self.next.iter().map(|reg| reg.borrow().clone()).collect()
+    }
+
+    /// Load `state` into the next-state registers (for evaluating
+    /// next()-predicates over a concrete edge (current, next)).
+    pub fn load_next(&self, state: &State) {
+        debug_assert_eq!(state.len(), self.next.len());
+        for (reg, value) in self.next.iter().zip(state.iter()) {
+            *reg.borrow_mut() = Some(value.clone());
+        }
+    }
+
     /// Collect the next state after a successful action run. Every variable
     /// must have been assigned.
     pub fn take_next_state(&self) -> Result<State, QuintError> {

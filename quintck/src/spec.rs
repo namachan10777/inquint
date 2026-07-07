@@ -13,6 +13,8 @@ pub struct CompiledSpec {
     pub init: CompiledExpr,
     pub step: CompiledExpr,
     pub invariants: Vec<(QuintName, CompiledExpr)>,
+    pub temporal: Vec<crate::temporal::Property>,
+    pub atoms: crate::temporal::AtomTable,
 }
 
 #[derive(Default)]
@@ -21,6 +23,8 @@ pub struct EntryPoints {
     pub step: Option<String>,
     /// Invariant names; when empty, `q::inv` is used if present.
     pub invariants: Vec<String>,
+    /// Temporal property names to check.
+    pub temporal: Vec<String>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -33,7 +37,7 @@ pub enum BuildError {
         name: String,
         available: String,
     },
-    #[error("temporal properties are not supported by quintck v1 (found {0})")]
+    #[error("cannot translate temporal property: {0}")]
     Temporal(String),
     #[error("the module declares no state variables")]
     NoVars,
@@ -70,20 +74,6 @@ fn available_actions(module: &quint_ast::QuintModule) -> String {
 impl CompiledSpec {
     pub fn build(out: &CompiledOutput, entry: &EntryPoints) -> Result<Self, BuildError> {
         let module = out.module();
-
-        // Reject temporal entry points explicitly.
-        if let Some(t) = module.declarations.iter().find_map(|d| match d {
-            Declaration::OpDef(op)
-                if op.qualifier == OpQualifier::Temporal
-                    && op.name.as_ref() == "q::temporalProps" =>
-            {
-                Some(op.name.to_string())
-            }
-            _ => None,
-        }) {
-            return Err(BuildError::Temporal(t));
-        }
-
         let vars = VarTable::from_module(module);
         if vars.is_empty() {
             return Err(BuildError::NoVars);
@@ -117,6 +107,17 @@ impl CompiledSpec {
             }
         }
 
+        // Temporal property defs: requested names, or q::temporalProps.
+        let mut temporal_defs: Vec<(QuintName, &OpDef)> = Vec::new();
+        for name in &entry.temporal {
+            let def = find_def(module, name).ok_or_else(|| BuildError::NoSuchDef {
+                kind: "temporal property",
+                name: name.clone(),
+                available: available_actions(module),
+            })?;
+            temporal_defs.push((QuintName::from(name.as_str()), def));
+        }
+
         let mut compiler = Compiler::new(&out.table, &vars);
         let init = compiler.compile(&init_def.expr);
         let step = compiler.compile(&step_def.expr);
@@ -124,6 +125,16 @@ impl CompiledSpec {
             .into_iter()
             .map(|(name, def)| (name, compiler.compile(&def.expr)))
             .collect();
+
+        let mut parser = crate::temporal::parse::Parser::new(&mut compiler, &out.table);
+        let mut temporal = Vec::new();
+        for (name, def) in temporal_defs {
+            let prop = parser
+                .parse_property(name.clone(), &def.expr)
+                .map_err(|e| BuildError::Temporal(format!("{name}: {e}")))?;
+            temporal.push(prop);
+        }
+        let atoms = parser.atoms;
         let storage = compiler.storage.clone();
 
         Ok(CompiledSpec {
@@ -132,16 +143,15 @@ impl CompiledSpec {
             init,
             step,
             invariants,
+            temporal,
+            atoms,
         })
     }
 
     /// Evaluate one invariant against a state (no nondeterminism allowed).
     pub fn eval_invariant_at(&self, state: &State, inv: &CompiledExpr) -> EvalResult {
         self.storage.borrow().load(state);
-        let mut env = Env {
-            storage: self.storage.clone(),
-            choices: None,
-        };
+        let mut env = Env::new(self.storage.clone(), None);
         inv.execute(&mut env)
     }
 }

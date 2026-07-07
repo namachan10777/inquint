@@ -44,6 +44,37 @@ violation|Paxos|6|fixtures/Paxos.json --invariant=brokenNothingChosen --max-step
 pass|Raft||fixtures/Raft.json --invariant=electionSafety,logMatching,voteIntegrity --max-steps=8
 violation|Raft|3|fixtures/Raft.json --invariant=brokenNoLeader --max-steps=4
 violation|Raft|2|fixtures/Raft.json --invariant=brokenAtMostOneCandidate --max-steps=3
+pass|TwoPhaseCommit-t||fixtures/TwoPhaseCommit_temporal.json --temporal=decisionReached,committedPropagates
+violation|TwoPhaseCommit-t||fixtures/TwoPhaseCommit_temporal.json --temporal=brokenDecisionNoFairness
+pass|ReadersWriters-t||fixtures/ReadersWriters_temporal.json --temporal=noStarvation
+violation|ReadersWriters-t||fixtures/ReadersWriters_temporal.json --temporal=brokenNoStarvationNoFairness
+pass|TwoLayeredCache-t||fixtures/TwoLayeredCache_temporal.json --temporal=verMonotone,verNeverDecreases,eventuallyClean
+violation|TwoLayeredCache-t||fixtures/TwoLayeredCache_temporal.json --temporal=brokenAlwaysProgress
+violation|TwoLayeredCache-t||fixtures/TwoLayeredCache_temporal.json --temporal=brokenEventuallyCleanNoFairness
+pass|DiningPhilosophers-t||fixtures/DiningPhilosophers_temporal.json --temporal=noDeadlock,someoneEats
+violation|DiningPhilosophers-t|6|fixtures/DiningPhilosophers_naive_temporal.json --temporal=naive::noDeadlock --no-deadlock
+violation|DiningPhilosophers-t||fixtures/DiningPhilosophers_temporal.json --temporal=brokenSomeoneEatsNoFairness
+pass|ReliableBroadcast-t||fixtures/ReliableBroadcast_temporal.json --temporal=totality
+violation|ReliableBroadcast-t||fixtures/ReliableBroadcast_temporal.json --temporal=brokenTotalityNoFairness
+pass|Raft-t||fixtures/Raft_election.json --temporal=termsMonotone,quorumCandidateProgress
+violation|Raft-t||fixtures/Raft_election.json --temporal=brokenEventuallyLeaderNoFairness
+pass|TwoPhaseCommit-test||fixtures/TwoPhaseCommit.json --test=happyPathTest,abortTest,commitWithoutDecisionTest
+pass|TeachingConcurrency-test||fixtures/TeachingConcurrency.json --test
+pass|LamportMutex-test||fixtures/LamportMutex.json --test=enterExitTest
+pass|examples-t||fixtures/weakFairness.json --temporal=eventuallyDone,notDoneLeadsToDone
+violation|examples-t||fixtures/weakFairness.json --temporal=notDoneLeadsToDoneNoFairness
+pass|examples-t||fixtures/strongFairness.json --temporal=eventuallyHundredDegrees
+violation|examples-t||fixtures/strongFairness.json --temporal=eventuallyHundredDegreesWeakOnly
+pass|TemporalLab||fixtures/TemporalLab_stutter.json --temporal=fairReach
+violation|TemporalLab||fixtures/TemporalLab_stutter.json --temporal=brokenReach
+pass|TemporalLab||fixtures/TemporalLab_cycle.json --temporal=fairRevisitZero
+violation|TemporalLab||fixtures/TemporalLab_cycle.json --temporal=brokenReachFive
+violation|TemporalLab||fixtures/TemporalLab_cycle.json --temporal=brokenRevisitZero
+pass|TemporalLab||fixtures/TemporalLab_sf.json --temporal=strongFire
+violation|TemporalLab||fixtures/TemporalLab_sf.json --temporal=brokenWeakFire
+pass|examples-t||fixtures/ewd426_temporal.json --temporal=convergence,closure,persistence --no-deadlock
+pass|examples-t||fixtures/ewd840_temporal.json --temporal=liveness --no-deadlock
+violation|examples-t||fixtures/ewd840_temporal.json --temporal=falseLiveness --no-deadlock
 EOF
 )
 

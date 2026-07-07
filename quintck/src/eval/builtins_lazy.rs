@@ -88,22 +88,29 @@ pub fn lazy_op(op: &str) -> LazyFn {
             }
             Ok(Value::bool(true))
         },
-        // Choice point: execute exactly ONE branch, selected by the oracle.
-        // Every enabled branch becomes a distinct successor via a distinct
-        // choice trail (the reference simulator instead shuffles and takes
-        // the first enabled branch).
+        // Choice point: the oracle picks a branch. In checking mode a
+        // disabled pick is simply a failed path (fail-fast; the successor
+        // set is unaffected). In run-test mode (`any_fallthrough`) the
+        // first enabled branch from the pick onward (cyclically) executes,
+        // so `any` returns false only when NO branch is enabled — matching
+        // quint's "choose among enabled branches" semantics. Exhaustive
+        // enumeration covers every enabled branch in both modes.
         "actionAny" => |env, args| {
-            let Some(i) = env.choose(args.len() as u64)? else {
+            let n = args.len();
+            let Some(start) = env.choose(n as u64)? else {
                 return Ok(Value::bool(false));
             };
             let snapshot = env.storage.borrow().snapshot_next();
-            let result = args[i as usize].execute(env)?;
-            if result.as_bool() {
-                Ok(Value::bool(true))
-            } else {
+            let tries = if env.any_fallthrough { n } else { 1 };
+            for k in 0..tries {
+                let branch = (start as usize + k) % n;
+                let result = args[branch].execute(env)?;
+                if result.as_bool() {
+                    return Ok(Value::bool(true));
+                }
                 env.storage.borrow().restore_next(&snapshot);
-                Ok(Value::bool(false))
             }
+            Ok(Value::bool(false))
         },
         // Bare oneOf (outside a nondet let): a choice point over the set.
         // Empty set is a hard error, matching the reference (QNT509).
@@ -121,9 +128,71 @@ pub fn lazy_op(op: &str) -> LazyFn {
             }
             set.pick(&mut indices.into_iter())
         },
-        "next" | "then" | "reps" | "expect" => {
-            |_, _| Err(unsupported("run/temporal operator (then/reps/expect/next)"))
-        }
+        // next(x): evaluate the argument against the next-state register
+        // bank. Only legal inside temporal edge-atom evaluation.
+        "next" => |env, args| {
+            if !env.next_allowed {
+                return Err(unsupported("next() outside a temporal property"));
+            }
+            let saved = env.next_mode;
+            env.next_mode = true;
+            let result = args[0].execute(env);
+            env.next_mode = saved;
+            result
+        },
+        // Run-test operators. `a.then(b)`: run a, commit the state, run b.
+        "then" => |env, args| {
+            let first = args[0].execute(env)?;
+            if !first.as_bool() {
+                return Err(QuintError::new(
+                    "QNT513",
+                    "Cannot continue in `then` because the highlighted expression evaluated to false",
+                ));
+            }
+            env.storage.borrow().shift();
+            args[1].execute(env)
+        },
+        // n.reps(i => A(i)): run A n times, committing between iterations.
+        "reps" => |env, args| {
+            let reps = args[0].execute(env)?.as_int();
+            let mut result = Value::bool(true);
+            for i in 0..reps {
+                let closure = args[1].execute(env)?;
+                result = apply_lambda(&closure, env, vec![Value::int(i)])?;
+                if !result.as_bool() {
+                    return Err(QuintError::new(
+                        "QNT513",
+                        format!(
+                            "Reps loop could not continue after iteration #{} evaluated to false",
+                            i + 1
+                        ),
+                    ));
+                }
+                if i < reps - 1 {
+                    env.storage.borrow().shift();
+                }
+            }
+            Ok(result)
+        },
+        // a.expect(p): a must be enabled; p must hold in a's post-state;
+        // the net effect on the state is exactly a's.
+        "expect" => |env, args| {
+            let action_result = args[0].execute(env)?;
+            if !action_result.as_bool() {
+                return Err(QuintError::new("QNT508", "Cannot continue to \"expect\""));
+            }
+            let snapshot = env.storage.borrow().snapshot_next();
+            env.storage.borrow().shift();
+            let predicate = args[1].execute(env)?;
+            env.storage.borrow().restore_next(&snapshot);
+            if !predicate.as_bool() {
+                return Err(QuintError::new(
+                    "QNT508",
+                    "Expect condition does not hold true",
+                ));
+            }
+            Ok(Value::bool(true))
+        },
         _ => panic!("unknown lazy op: {op}"),
     }
 }

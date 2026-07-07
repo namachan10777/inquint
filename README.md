@@ -4,32 +4,59 @@ Fast explicit-state (TLC-like) model checker for [Quint](https://quint-lang.org/
 
 quintck consumes the flattened JSON IR produced by `quint compile --target=json`,
 explores the state space breadth-first with exhaustive enumeration of all
-nondeterminism (`any` branches, `nondet ... oneOf` picks), checks invariants,
-detects deadlocks, and emits counterexample traces in
-[ITF format](https://apalache-mc.org/docs/adr/015adr-trace.html).
-BFS guarantees shortest counterexamples.
+nondeterminism (`any` branches, `nondet ... oneOf` picks), checks invariants
+and **temporal (LTL/liveness) properties**, detects deadlocks, executes `run`
+test definitions, and emits counterexample traces in
+[ITF format](https://apalache-mc.org/docs/adr/015adr-trace.html) — including
+lassos with `loop_index` for liveness violations. BFS guarantees shortest
+safety counterexamples.
+
+Temporal checking is automata-theoretic: properties are translated to LTL
+over state/edge atoms (with `Set.forall`-quantifiers over constant sets
+expanded), safety-shaped bodies (`always` of propositional/action formulas,
+incl. `orKeep`, `mustChange`, `enabled`, `next(...)` predicates) are checked
+as invariants over the stutter-closed state graph, and liveness goes through
+a GPVW tableau (¬property → generalized Büchi automaton), a product with the
+state graph, and Tarjan SCC analysis. `weakFair`/`strongFair` premises
+(`F1 and ... and Fn implies Body`) are handled TLC-style as SCC acceptance
+side conditions, including strong-fairness refinement. Every extracted lasso
+is self-validated against the negated property in debug builds.
 
 ## Usage
 
 ```sh
-# From a .qnt file (requires `quint` on PATH; compiled internally)
+# Invariants, from a .qnt file (requires `quint` on PATH; compiled internally)
 quintck specs/Paxos.qnt --main=main --invariant=agreement --max-steps=8
+
+# Temporal properties (exhaustive by construction)
+quintck specs/ReadersWriters.qnt --main=main --temporal=noStarvation
+quintck specs/TwoLayeredCache.qnt --main=main \
+  --temporal=verMonotone,eventuallyClean --out-itf lasso.itf.json
 
 # From a pre-compiled JSON file
 quint compile --target=json --main=main --invariant=agreement spec.qnt > spec.json
 quintck spec.json --invariant=agreement --exhaustive
 
-# Named init/step (e.g. qualified instances), ITF counterexample output
+# Named init/step (e.g. qualified instances)
 quintck specs/DiningPhilosophers.qnt --main=dining_naive \
   --init=naive::init --step=naive::step --exhaustive --out-itf trace.itf.json
+
+# Run-test execution: every path through a run's nondeterminism must pass
+quintck specs/TwoPhaseCommit.qnt --main=main --test=happyPathTest,abortTest
 ```
 
-Exit codes: `0` = all invariants hold (within the step bound), `1` = violation
-found (invariant or deadlock; output contains `[violation]` and the trace),
+Exit codes: `0` = all properties hold, `1` = violation found (invariant,
+deadlock, or temporal; output contains `[violation]` and the trace/lasso),
 `2` = tool error / unsupported feature.
 
-Options: `--max-steps N` (default 10) / `--exhaustive`, `--no-deadlock`,
-`--max-states N`, `--out-itf PATH`.
+Options: `--max-steps N` (default 10) / `--exhaustive` (temporal checking is
+always exhaustive), `--no-deadlock`, `--max-states N`, `--out-itf PATH`,
+`--temporal P1,P2`, `--test [T1,T2]`.
+
+Known limits: `weakFair`/`strongFair` only as top-level premises; integers
+are i64; `allLists`, `Int`/`Nat` enumeration, and `apalache::generate` are
+rejected. Unbounded random-walk `run` tests (e.g. `20.reps(_ => step)`) can
+exceed the path-enumeration cap — use the model checker for those.
 
 ## Workspace
 
@@ -59,10 +86,16 @@ heavyweight instance per algorithm (each spec's `module bench`,
 with the unoptimized v1 checker. These instances are far beyond what
 Apalache/TLC handle in reasonable time and are checked by quintck only.
 
-## v1 scope
+## Harnesses
 
-Invariants, deadlock detection, ITF traces. Temporal properties are rejected
-with an explicit error (use `quint verify --backend=tlc` meanwhile). Integers
-are `i64` with checked arithmetic. Single-threaded BFS with full states as
-seen-set keys; fingerprinting, structural sharing, and parallel exploration
-are the planned optimization path.
+- `bash quintck-check.sh` — the correctness gate: 53 checks over the corpus
+  (invariants with exact counterexample depths, temporal verdicts, run
+  tests, detection-lab lassos).
+- `bash temporal-diff.sh` — differential test: quintck's temporal verdicts
+  vs `quint verify --backend=tlc` on the same properties (20 cases, all
+  agreeing; the two TLA forms TLC cannot parse are covered natively).
+- `bash quintck-bench.sh` — the ~1-minute-per-spec performance suite.
+
+Single-threaded BFS with full states as seen-set keys; fingerprinting,
+structural sharing, and parallel exploration are the planned optimization
+path.

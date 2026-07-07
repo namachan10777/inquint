@@ -8,6 +8,7 @@ pub struct QntOptions<'a> {
     pub init: Option<&'a str>,
     pub step: Option<&'a str>,
     pub invariants: &'a [String],
+    pub temporal: &'a [String],
 }
 
 pub fn load_input(input: &Path, opts: &QntOptions) -> Result<String, String> {
@@ -43,6 +44,9 @@ pub fn load_input(input: &Path, opts: &QntOptions) -> Result<String, String> {
             }
             if !opts.invariants.is_empty() {
                 cmd.arg(format!("--invariant={}", opts.invariants.join(",")));
+            }
+            if !opts.temporal.is_empty() {
+                cmd.arg(format!("--temporal={}", opts.temporal.join(",")));
             }
 
             let output = cmd

@@ -59,6 +59,51 @@ benchgen LamportMutex mutex,requestConsistency
 benchgen Paxos agreement,oneValuePerBallot
 benchgen Raft electionSafety,logMatching,voteIntegrity
 
+# Temporal-property fixtures: compiled with --temporal so the property defs
+# and their dependencies survive flattening. Used by quintck's native
+# temporal checking (specs/check.sh checks the same properties with TLC).
+echo "generating temporal fixtures"
+quint compile --target=json specs/TwoLayeredCache.qnt --main=main \
+  --invariant=cleanConsistency \
+  --temporal=verMonotone,verNeverDecreases,eventuallyClean,brokenAlwaysProgress,brokenEventuallyCleanNoFairness \
+  > fixtures/TwoLayeredCache_temporal.json
+quint compile --target=json specs/TwoPhaseCommit.qnt --main=main \
+  --temporal=decisionReached,committedPropagates,brokenDecisionNoFairness \
+  > fixtures/TwoPhaseCommit_temporal.json
+quint compile --target=json specs/ReadersWriters.qnt --main=main \
+  --temporal=noStarvation,brokenNoStarvationNoFairness \
+  > fixtures/ReadersWriters_temporal.json
+quint compile --target=json specs/ReliableBroadcast.qnt --main=main \
+  --temporal=totality,brokenTotalityNoFairness \
+  > fixtures/ReliableBroadcast_temporal.json
+quint compile --target=json specs/DiningPhilosophers.qnt --main=dining_fixed \
+  --temporal=noDeadlock,someoneEats,brokenSomeoneEatsNoFairness \
+  > fixtures/DiningPhilosophers_temporal.json
+quint compile --target=json specs/DiningPhilosophers.qnt --main=dining_naive \
+  --init=naive::init --step=naive::step --temporal=naive::noDeadlock \
+  > fixtures/DiningPhilosophers_naive_temporal.json
+quint compile --target=json specs/Raft.qnt --main=raft_election \
+  --temporal=termsMonotone,quorumCandidateProgress,brokenEventuallyLeaderNoFairness \
+  > fixtures/Raft_election.json
+
+# Detection-lab specs with known lasso shapes (quintck-only).
+quint compile --target=json specs/TemporalLab.qnt --main=stutter_lab \
+  --temporal=brokenReach,fairReach > fixtures/TemporalLab_stutter.json
+quint compile --target=json specs/TemporalLab.qnt --main=cycle_lab \
+  --temporal=brokenReachFive,fairRevisitZero,brokenRevisitZero > fixtures/TemporalLab_cycle.json
+quint compile --target=json specs/TemporalLab.qnt --main=sf_lab \
+  --temporal=brokenWeakFire,strongFire > fixtures/TemporalLab_sf.json
+
+# Temporal fixtures from the upstream quint examples (liveness references).
+quint compile --target=json quint/examples/classic/distributed/ewd840/ewd840.qnt \
+  --main=ewd840_3 --temporal=liveness,falseLiveness > fixtures/ewd840_temporal.json
+quint compile --target=json quint/examples/classic/distributed/ewd426/ewd426.qnt \
+  --main=ewd426 --temporal=convergence,closure,persistence > fixtures/ewd426_temporal.json
+quint compile --target=json quint/examples/language-features/weakFairness.qnt \
+  --temporal=eventuallyDone,notDoneLeadsToDone,notDoneLeadsToDoneNoFairness > fixtures/weakFairness.json
+quint compile --target=json quint/examples/language-features/strongFairness.qnt \
+  --temporal=eventuallyHundredDegrees,eventuallyHundredDegreesWeakOnly > fixtures/strongFairness.json
+
 # Upstream evaluator fixtures, for parser coverage of specs we didn't write.
 for f in simple tictactoe ewd426 ewd840; do
   echo "copying $f.json from quint/evaluator/fixtures"

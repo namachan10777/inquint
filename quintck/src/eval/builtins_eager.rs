@@ -365,9 +365,51 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             }
             Ok(set.iter().next().cloned().unwrap())
         },
-        "q::debug" => |_, args| Ok(args[1].clone()),
-        "allLists" | "allListsUpTo" | "chooseSome" | "always" | "eventually" | "enabled"
-        | "orKeep" | "mustChange" | "weakFair" | "strongFair" | "leadsTo" => {
+        "q::debug" => |_, args| {
+            eprintln!("> {} {}", args[0].as_str(), args[1]);
+            Ok(args[1].clone())
+        },
+        // All lists over a set with length <= n.
+        "allListsUpTo" => |_, args| {
+            let elems: Vec<Value> = args[0].enumerate()?.iter().cloned().collect();
+            let max_len = args[1].as_int().max(0) as u32;
+            let count = (elems.len() as u64)
+                .checked_pow(max_len)
+                .filter(|c| *c <= crate::value::MAX_ENUM)
+                .ok_or_else(|| unsupported("allListsUpTo of this size"))?;
+            let _ = count;
+            let mut lists: Vec<Vec<Value>> = vec![Vec::new()];
+            let mut frontier: Vec<Vec<Value>> = vec![Vec::new()];
+            for _ in 0..max_len {
+                let mut next_frontier = Vec::new();
+                for list in &frontier {
+                    for e in &elems {
+                        let mut l = list.clone();
+                        l.push(e.clone());
+                        next_frontier.push(l);
+                    }
+                }
+                lists.extend(next_frontier.iter().cloned());
+                frontier = next_frontier;
+            }
+            Value::set(
+                lists
+                    .into_iter()
+                    .map(Value::list)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        },
+        // Deterministic pick: the canonical (BTree-least) element.
+        "chooseSome" => |_, args| {
+            args[0]
+                .enumerate()?
+                .iter()
+                .next()
+                .cloned()
+                .ok_or_else(|| QuintError::new("QNT505", "Called 'chooseSome' on an empty set"))
+        },
+        "allLists" | "always" | "eventually" | "enabled" | "orKeep" | "mustChange"
+        | "weakFair" | "strongFair" | "leadsTo" => {
             |_, _| Err(unsupported("this built-in operator"))
         }
         _ => return None,

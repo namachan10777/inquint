@@ -36,7 +36,7 @@ impl<'t> Compiler<'t> {
         }
     }
 
-    fn param_register(&mut self, param: &LambdaParam) -> Rc<RefCell<Option<Value>>> {
+    pub fn param_register(&mut self, param: &LambdaParam) -> Rc<RefCell<Option<Value>>> {
         self.param_registry
             .entry(param.id)
             .or_insert_with(|| Rc::new(RefCell::new(None)))
@@ -74,9 +74,11 @@ impl<'t> Compiler<'t> {
                     .var_index
                     .get(id)
                     .unwrap_or_else(|| panic!("unknown variable {name} (id {id})"));
-                let register = self.storage.borrow().current[index].clone();
+                let current = self.storage.borrow().current[index].clone();
+                let next = self.storage.borrow().next[index].clone();
                 let name = name.clone();
-                CompiledExpr::new(move |_| {
+                CompiledExpr::new(move |env| {
+                    let register = if env.next_mode { &next } else { &current };
                     register.borrow().clone().ok_or_else(|| {
                         QuintError::new("QNT502", format!("Variable {name} not set"))
                     })
@@ -141,6 +143,12 @@ impl<'t> Compiler<'t> {
                 let cell: Rc<RefCell<Option<EvalResult>>> = Rc::new(RefCell::new(None));
                 self.storage.borrow_mut().caches_to_clear.push(cell.clone());
                 CompiledExpr::new(move |env| {
+                    // The per-state cache is keyed on the *current* state;
+                    // under next_mode the val reads the next state, so the
+                    // cache must be bypassed entirely (read and write).
+                    if env.next_mode {
+                        return base.execute(env);
+                    }
                     let cached = cell.borrow().clone();
                     if let Some(Ok(v)) = cached {
                         return Ok(v);

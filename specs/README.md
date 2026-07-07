@@ -55,6 +55,14 @@ Notes on scope:
   the upstream quint examples. TLC properties run on the election-only
   instance (`MaxLogLen = 0`).
 
+## TemporalLab
+
+`TemporalLab.qnt` holds three tiny machines with *known* liveness
+counterexample shapes, used as deterministic detection tests for temporal
+checkers (quintck-only, not part of `check.sh`): a pure stuttering lasso, a
+real-cycle lasso (mod-3 counter), and a weak-vs-strong-fairness
+discriminator (an action enabled only intermittently along the fair cycle).
+
 ## Bench instances
 
 Each spec additionally defines a `module bench` — a much larger instance
