@@ -9,7 +9,7 @@ use super::Vm;
 use crate::error::QuintError;
 use crate::eval::builtins_eager::{eager_op, EagerFn};
 use crate::eval::Env;
-use crate::value::{value_cmp, EvalResult, Value};
+use crate::value::{EvalResult, Value};
 
 pub type HoFn = fn(&mut Vm, &mut Env, &[Value]) -> EvalResult;
 
@@ -101,7 +101,7 @@ pub fn vm_builtin(op: &str) -> Option<VmBuiltin> {
         "setBy" => |vm, env, args| {
             let entries = args[0].as_map();
             let key = args[1].normalize()?;
-            match entries.binary_search_by(|(k, _)| value_cmp(*k, key)) {
+            match crate::value::map_find(entries, key) {
                 Ok(i) => {
                     let new = vm.call_lambda(env, args[2], &[entries[i].1])?.normalize()?;
                     let mut out = entries.to_vec();

@@ -110,14 +110,41 @@ pub struct LambdaVal {
 // The store
 // ---------------------------------------------------------------------------
 
+/// One interned value: its node plus the order-preserving 8-byte digest.
+/// Kept together so a `value_cmp` operand costs one cache line.
+#[derive(Clone, Copy)]
+struct Entry {
+    /// If two values' keys differ (and neither is [`NO_ORDER_KEY`]), their
+    /// key order equals [`value_cmp`]. Precomputed at intern time so sorts
+    /// and binary searches rarely need the deep structural compare.
+    key: u64,
+    data: &'static ValueData,
+}
+
 struct ValueStore {
     /// Intern table: stores only ids; hashing/comparison read `entries`.
     /// Lookups take borrowed slices (see `intern_seq` etc.), so an intern
     /// *hit* — the common case — allocates nothing.
     map: hashbrown::HashTable<Value>,
-    entries: Vec<&'static ValueData>,
+    entries: Vec<Entry>,
     shapes: FxHashMap<&'static [Symbol], &'static RecordShape>,
     lambdas: Vec<&'static LambdaVal>,
+}
+
+/// Sentinel key for lambdas and symbolic set forms: comparing those is a
+/// bug that must keep panicking in the deep path, so they never win the
+/// key short-circuit. Unreachable for real keys (their top byte is a
+/// discriminant rank ≤ 15).
+const NO_ORDER_KEY: u64 = u64::MAX;
+
+/// The first (up to) 7 bytes of a string, big-endian in bits 0..56: byte
+/// prefix order equals `str` order (UTF-8 comparison is bytewise).
+fn str_prefix7(s: &str) -> u64 {
+    let mut k = 0u64;
+    for (i, b) in s.bytes().take(7).enumerate() {
+        k |= (b as u64) << (48 - 8 * i);
+    }
+    k
 }
 
 /// Container kinds interned from borrowed slices.
@@ -231,25 +258,63 @@ impl ValueStore {
         store
     }
 
+    /// Order key of an interned child value.
+    fn key_of(&self, v: Value) -> u64 {
+        self.entries[v.index()].key
+    }
+
+    /// Compute the order-preserving digest for a node whose children are
+    /// already interned. Soundness: the digest is `[rank byte | 7-byte
+    /// prefix of the first comparand's own key stream]`, and `value_cmp`
+    /// orders same-rank values by exactly that first comparand — so a
+    /// digest difference always decides the comparison the same way the
+    /// deep compare would; digest equality is "undecided" and falls back.
+    fn compute_order_key(&self, data: &ValueData) -> u64 {
+        let rank = (discriminant_rank(data) as u64) << 56;
+        let first_child = |c: Option<&Value>| -> u64 {
+            // top 7 bytes of the child's key, shifted below the rank byte
+            rank | c.map_or(0, |&e| self.key_of(e) >> 8)
+        };
+        match data {
+            ValueData::Bool(b) => rank | ((*b as u64) << 48),
+            ValueData::Int(n) => rank | (((*n as u64) ^ (1u64 << 63)) >> 8),
+            ValueData::Str(s) => rank | str_prefix7(s.as_str()),
+            ValueData::Set(es) | ValueData::Tuple(es) | ValueData::List(es) => {
+                first_child(es.first())
+            }
+            ValueData::Record(shape, _) => {
+                rank | shape.fields.first().map_or(0, |f| str_prefix7(f.as_str()))
+            }
+            ValueData::Map(m) => first_child(m.first().map(|(k, _)| k)),
+            ValueData::Variant(label, _) => rank | str_prefix7(label.as_str()),
+            ValueData::Lambda(_) => NO_ORDER_KEY,
+            _ => {
+                debug_assert!(data.is_symbolic());
+                NO_ORDER_KEY
+            }
+        }
+    }
+
     /// Register a freshly interned node under a precomputed hash.
     fn insert_new(&mut self, hash: u64, data: ValueData) -> Value {
         let symbolic = data.is_symbolic();
+        let key = self.compute_order_key(&data);
         let leaked: &'static ValueData = Box::leak(Box::new(data));
         let index = self.entries.len() as u32 + 1;
         assert!(index < SYMBOLIC_BIT, "value store overflow");
         let bits = if symbolic { index | SYMBOLIC_BIT } else { index };
         let id = Value(NonZeroU32::new(bits).unwrap());
-        self.entries.push(leaked);
+        self.entries.push(Entry { key, data: leaked });
         let entries = &self.entries;
         self.map
-            .insert_unique(hash, id, |&v| hash_data(entries[v.index()]));
+            .insert_unique(hash, id, |&v| hash_data(entries[v.index()].data));
         id
     }
 
     fn intern(&mut self, data: ValueData) -> Value {
         let hash = hash_data(&data);
         let entries = &self.entries;
-        if let Some(&id) = self.map.find(hash, |&v| *entries[v.index()] == data) {
+        if let Some(&id) = self.map.find(hash, |&v| *entries[v.index()].data == data) {
             return id;
         }
         self.insert_new(hash, data)
@@ -260,7 +325,7 @@ impl ValueStore {
     fn intern_seq(&mut self, kind: SeqKind, elems: &[Value]) -> Value {
         let hash = hash_seq(kind, elems);
         let entries = &self.entries;
-        let found = self.map.find(hash, |&v| match (kind, entries[v.index()]) {
+        let found = self.map.find(hash, |&v| match (kind, entries[v.index()].data) {
             (SeqKind::Set, ValueData::Set(s)) => &**s == elems,
             (SeqKind::Tuple, ValueData::Tuple(s)) => &**s == elems,
             (SeqKind::List, ValueData::List(s)) => &**s == elems,
@@ -282,7 +347,7 @@ impl ValueStore {
     fn intern_map(&mut self, pairs: &[(Value, Value)]) -> Value {
         let hash = hash_map_entries(pairs);
         let entries = &self.entries;
-        let found = self.map.find(hash, |&v| match entries[v.index()] {
+        let found = self.map.find(hash, |&v| match entries[v.index()].data {
             ValueData::Map(m) => &**m == pairs,
             _ => false,
         });
@@ -295,7 +360,7 @@ impl ValueStore {
     fn intern_record(&mut self, shape: &'static RecordShape, values: &[Value]) -> Value {
         let hash = hash_record(shape, values);
         let entries = &self.entries;
-        let found = self.map.find(hash, |&v| match entries[v.index()] {
+        let found = self.map.find(hash, |&v| match entries[v.index()].data {
             ValueData::Record(s, vs) => std::ptr::eq(*s, shape) && &**vs == values,
             _ => false,
         });
@@ -391,10 +456,10 @@ impl ValueBuf {
         }
     }
 
-    /// Sort by [`value_cmp`] and drop duplicates (equal ⇔ same id).
+    /// Sort by the structural order and drop duplicates (equal ⇔ same id).
     fn sort_dedup(&mut self) {
+        sort_values_structural(self.as_mut_slice());
         let s = self.as_mut_slice();
-        s.sort_unstable_by(|a, b| value_cmp(*a, *b));
         let mut w = 0;
         for r in 0..s.len() {
             if w == 0 || s[r] != s[w - 1] {
@@ -403,6 +468,73 @@ impl ValueBuf {
             }
         }
         self.truncate(w);
+    }
+}
+
+/// [`value_cmp`] with the store already borrowed: lets a whole binary
+/// search or sort run under a single store access.
+fn value_cmp_in(s: &ValueStore, a: Value, b: Value) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let (ea, eb) = (s.entries[a.index()], s.entries[b.index()]);
+    if ea.key != eb.key && ea.key != NO_ORDER_KEY && eb.key != NO_ORDER_KEY {
+        return ea.key.cmp(&eb.key);
+    }
+    finish_cmp(value_cmp_deep(ea.data, eb.data))
+}
+
+/// Binary search over sorted map entries, one store access for the whole
+/// search (probes are mostly `u64` key compares).
+pub fn map_find(entries: &[(Value, Value)], key: Value) -> Result<usize, usize> {
+    VALUES.with_borrow(|s| entries.binary_search_by(|(k, _)| value_cmp_in(s, *k, key)))
+}
+
+/// Binary search over a sorted set slice, one store access for the whole
+/// search.
+pub fn set_find(elems: &[Value], needle: Value) -> Result<usize, usize> {
+    VALUES.with_borrow(|s| elems.binary_search_by(|&e| value_cmp_in(s, e, needle)))
+}
+
+/// Sort values by [`value_cmp`], fetching every element's order key in a
+/// single store access up front: the sort itself is then mostly `u64`
+/// compares (deep fallback only on key collisions). Elements must be
+/// normalized (containers never hold lambdas/symbolic forms).
+pub(crate) fn sort_values_structural(vs: &mut [Value]) {
+    let n = vs.len();
+    if n <= 1 {
+        return;
+    }
+    if n == 2 {
+        // no batching machinery for the trivial case
+        if value_cmp(vs[0], vs[1]) == Ordering::Greater {
+            vs.swap(0, 1);
+        }
+        return;
+    }
+    fn sort_pairs(pairs: &mut [(u64, Value)]) {
+        pairs.sort_unstable_by(|(ka, a), (kb, b)| ka.cmp(kb).then_with(|| value_cmp(*a, *b)));
+    }
+    if n <= 16 {
+        let mut pairs = [(0u64, Value::bool(false)); 16];
+        VALUES.with_borrow(|s| {
+            for (i, &v) in vs.iter().enumerate() {
+                pairs[i] = (s.entries[v.index()].key, v);
+            }
+        });
+        sort_pairs(&mut pairs[..n]);
+        for (dst, (_, v)) in vs.iter_mut().zip(&pairs[..n]) {
+            *dst = *v;
+        }
+    } else {
+        let mut pairs: Vec<(u64, Value)> = Vec::with_capacity(n);
+        VALUES.with_borrow(|s| {
+            pairs.extend(vs.iter().map(|&v| (s.entries[v.index()].key, v)));
+        });
+        sort_pairs(&mut pairs);
+        for (dst, (_, v)) in vs.iter_mut().zip(&pairs) {
+            *dst = *v;
+        }
     }
 }
 
@@ -479,7 +611,7 @@ impl Value {
     /// The interned node. `&'static`: the store is append-only and leaked.
     #[inline]
     pub fn data(self) -> &'static ValueData {
-        VALUES.with_borrow(|s| s.entries[self.index()])
+        VALUES.with_borrow(|s| s.entries[self.index()].data)
     }
 
     /// Raw id bits, for embedding in bytecode immediates.
@@ -496,7 +628,7 @@ impl Value {
 
     pub fn as_lambda(self) -> &'static LambdaVal {
         // single store access for data + registry
-        VALUES.with_borrow(|s| match s.entries[self.index()] {
+        VALUES.with_borrow(|s| match s.entries[self.index()].data {
             ValueData::Lambda(i) => s.lambdas[*i as usize],
             v => panic!("expected lambda, got {v:?}"),
         })
@@ -548,11 +680,6 @@ impl ValueData {
     }
 }
 
-/// Total structural order over *normalized* values — the same order as the
-/// pre-hash-consing `Ord`, so all user-visible enumeration is unchanged.
-/// Symbolic forms and lambdas must never be ordered (they never enter
-/// containers); doing so is a bug. Hash-consing gives `Equal ⇔ same id`, so
-/// comparison never recurses into equal subtrees.
 /// Guard for early returns out of [`value_cmp`]: distinct ids must never
 /// compare Equal (hash-consing invariant).
 #[inline]
@@ -564,12 +691,40 @@ fn finish_cmp(ord: Ordering) -> Ordering {
     ord
 }
 
+/// Total structural order over *normalized* values — the same order as the
+/// pre-hash-consing `Ord`, so all user-visible enumeration is unchanged.
+/// Symbolic forms and lambdas must never be ordered (they never enter
+/// containers); doing so is a bug. Hash-consing gives `Equal ⇔ same id`, so
+/// comparison never recurses into equal subtrees, and precomputed order
+/// keys decide most non-equal comparisons without touching the structure.
 pub fn value_cmp(a: Value, b: Value) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
-    let (da, db) = (a.data(), b.data());
-    let ord = match (da, db) {
+    // One store access for both nodes' data + order keys. Distinct valid
+    // keys decide the comparison outright (see `compute_order_key` for the
+    // soundness argument); equal keys fall back to the deep compare.
+    let (da, ka, db, kb) = VALUES.with_borrow(|s| {
+        let (ia, ib) = (a.index(), b.index());
+        {
+            let (ea, eb) = (s.entries[ia], s.entries[ib]);
+            (ea.data, ea.key, eb.data, eb.key)
+        }
+    });
+    if ka != kb && ka != NO_ORDER_KEY && kb != NO_ORDER_KEY {
+        let ord = ka.cmp(&kb);
+        debug_assert_eq!(
+            ord,
+            value_cmp_deep(da, db),
+            "order key inconsistent with structural order: {da:?} vs {db:?}"
+        );
+        return ord;
+    }
+    finish_cmp(value_cmp_deep(da, db))
+}
+
+fn value_cmp_deep(da: &ValueData, db: &ValueData) -> Ordering {
+    match (da, db) {
         (ValueData::Bool(x), ValueData::Bool(y)) => x.cmp(y),
         (ValueData::Int(x), ValueData::Int(y)) => x.cmp(y),
         (ValueData::Str(x), ValueData::Str(y)) => x.cmp(y),
@@ -580,7 +735,7 @@ pub fn value_cmp(a: Value, b: Value) -> Ordering {
             // Same interned shape (the common case): every key pair compares
             // Equal, so the interleaved order reduces to the value slices.
             if std::ptr::eq(*sa, *sb) {
-                return finish_cmp(cmp_slices(va, vb));
+                return cmp_slices(va, vb);
             }
             // Field-interleaved comparison, matching BTreeMap<QuintName, Value> order.
             let mut it_a = sa.fields.iter().zip(va.iter());
@@ -626,8 +781,7 @@ pub fn value_cmp(a: Value, b: Value) -> Ordering {
             panic!("cannot order symbolic set forms; normalize first (bug)")
         }
         _ => discriminant_rank(da).cmp(&discriminant_rank(db)),
-    };
-    finish_cmp(ord)
+    }
 }
 
 fn cmp_slices(a: &[Value], b: &[Value]) -> Ordering {
@@ -676,7 +830,7 @@ impl Value {
 
     /// Set from already-normalized elements (sorts and dedups).
     pub fn set_of_normalized(mut elems: Vec<Value>) -> Self {
-        elems.sort_unstable_by(|a, b| value_cmp(*a, *b));
+        sort_values_structural(&mut elems);
         elems.dedup();
         intern_seq(SeqKind::Set, &elems)
     }
@@ -750,15 +904,32 @@ impl Value {
     /// Map from already-normalized pairs (sorts by key; last duplicate wins,
     /// matching BTreeMap insert semantics).
     pub fn map_of_normalized(mut entries: Vec<(Value, Value)>) -> Self {
-        entries.sort_by(|a, b| value_cmp(a.0, b.0));
-        entries.dedup_by(|later, earlier| {
-            if later.0 == earlier.0 {
-                earlier.1 = later.1;
-                true
-            } else {
-                false
-            }
+        // Decorated sort: keys fetched once, and the original index keeps
+        // the unstable sort stable per key for the last-wins dedup.
+        let mut dec: Vec<(u64, u32, Value, Value)> = Vec::with_capacity(entries.len());
+        VALUES.with_borrow(|s| {
+            dec.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(k, v))| (s.entries[k.index()].key, i as u32, k, v)),
+            );
         });
+        dec.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| value_cmp(a.2, b.2))
+                .then(a.1.cmp(&b.1))
+        });
+        entries.clear();
+        for &(_, _, k, v) in &dec {
+            if let Some(last) = entries.last_mut() {
+                if last.0 == k {
+                    last.1 = v;
+                    continue;
+                }
+            }
+            entries.push((k, v));
+        }
         VALUES.with_borrow_mut(|s| s.intern_map(&entries))
     }
 
@@ -905,10 +1076,7 @@ impl Value {
     /// Map lookup by (normalized) key: binary search over the sorted entries.
     pub fn map_get(self, key: Value) -> Option<Value> {
         let entries = self.as_map();
-        entries
-            .binary_search_by(|(k, _)| value_cmp(*k, key))
-            .ok()
-            .map(|i| entries[i].1)
+        map_find(entries, key).ok().map(|i| entries[i].1)
     }
 }
 
@@ -958,9 +1126,7 @@ impl Value {
     /// any container).
     pub fn contains(self, elem: Value) -> Result<bool, QuintError> {
         Ok(match (self.data(), elem.data()) {
-            (ValueData::Set(s), _) => s
-                .binary_search_by(|&e| value_cmp(e, elem))
-                .is_ok(),
+            (ValueData::Set(s), _) => set_find(s, elem).is_ok(),
             (ValueData::Interval(start, end), ValueData::Int(n)) => start <= n && n <= end,
             (ValueData::Interval(_, _), _) => false,
             (ValueData::CrossProduct(sets), ValueData::Tuple(elems)) => {
@@ -1063,7 +1229,7 @@ impl Value {
                         i += 1;
                     }
                 }
-                out.sort_unstable_by(|a, b| value_cmp(*a, *b));
+                sort_values_structural(&mut out);
                 out.dedup();
                 Ok(Cow::Owned(out))
             }
@@ -1190,9 +1356,14 @@ pub fn value_eq(a: Value, b: Value) -> Result<bool, QuintError> {
     if a == b {
         return Ok(true);
     }
+    // hash-consed: distinct non-symbolic ids ⇒ unequal (tag-bit tests
+    // only, no store access — this is the `eq` builtin's hot path)
+    if !a.is_symbolic() && !b.is_symbolic() {
+        return Ok(false);
+    }
     let (ia, ib) = (a.data(), b.data());
     match (ia.is_symbolic(), ib.is_symbolic()) {
-        (false, false) => Ok(false), // hash-consed: distinct ids ⇒ unequal
+        (false, false) => Ok(false),
         _ => match (ia, ib) {
             (ValueData::InfiniteInt | ValueData::InfiniteNat, _)
             | (_, ValueData::InfiniteInt | ValueData::InfiniteNat) => Ok(false),
@@ -1290,5 +1461,86 @@ impl fmt::Display for Value {
             }
             ValueData::Lambda(_) => write!(f, "<lambda>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(v: Value) -> u64 {
+        VALUES.with_borrow(|s| s.entries[v.index()].key)
+    }
+
+    /// Key soundness: for every pair with distinct valid keys, the key
+    /// order must equal the structural order.
+    #[test]
+    fn order_keys_agree_with_value_cmp() {
+        let s = |t: &str| Value::str(Symbol::intern(t));
+        let set = |vs: &[Value]| Value::set(vs.iter().copied()).unwrap();
+        let tup = |vs: &[Value]| Value::tuple(vs.iter().copied()).unwrap();
+        let rec = |fs: &[(&str, Value)]| {
+            Value::record(fs.iter().map(|(k, v)| (Symbol::intern(k), *v))).unwrap()
+        };
+        let map = |es: &[(Value, Value)]| Value::map(es.iter().copied()).unwrap();
+
+        let values = vec![
+            Value::bool(false),
+            Value::bool(true),
+            Value::int(-5000),
+            Value::int(-1),
+            Value::int(0),
+            Value::int(1),
+            Value::int(1 << 40),
+            Value::int((1 << 40) + 1), // differs only in the low byte
+            s(""),
+            s("a"),
+            s("ab"),
+            s("prefix_shared_x"),
+            s("prefix_shared_y"), // shares a 7-byte prefix
+            set(&[]),
+            set(&[Value::bool(false)]),
+            set(&[Value::int(1), Value::int(2)]),
+            set(&[Value::int(3)]),
+            tup(&[]),
+            tup(&[Value::int(1), s("a")]),
+            tup(&[Value::int(2)]),
+            Value::list([Value::int(9)]).unwrap(),
+            rec(&[("a", Value::int(1))]),
+            rec(&[("a", Value::int(2))]),
+            rec(&[("b", Value::int(1))]),
+            map(&[]),
+            map(&[(s("k1"), Value::int(1))]),
+            map(&[(s("k2"), Value::int(1))]),
+            Value::variant(Symbol::intern("Some"), Value::int(1)).unwrap(),
+            Value::variant(Symbol::intern("None"), tup(&[])).unwrap(),
+        ];
+
+        for &a in &values {
+            for &b in &values {
+                let (ka, kb) = (key(a), key(b));
+                if ka != kb && ka != NO_ORDER_KEY && kb != NO_ORDER_KEY {
+                    assert_eq!(
+                        ka.cmp(&kb),
+                        value_cmp(a, b),
+                        "key order diverges from structural order: {a:?} vs {b:?}"
+                    );
+                }
+                if a == b {
+                    assert_eq!(ka, kb);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unorderable_values_have_no_order_key() {
+        assert_eq!(key(Value::interval(1, 3)), NO_ORDER_KEY);
+        assert_eq!(key(Value::power_set(Value::interval(1, 2))), NO_ORDER_KEY);
+        assert_eq!(key(Value::infinite_int()), NO_ORDER_KEY);
+        assert_eq!(
+            key(Value::map_set(Value::interval(1, 2), Value::interval(1, 2))),
+            NO_ORDER_KEY
+        );
     }
 }

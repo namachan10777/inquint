@@ -254,7 +254,7 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
         "set" => |_, args| {
             let entries = args[0].as_map();
             let key = args[1].normalize()?;
-            match entries.binary_search_by(|(k, _)| value_cmp(*k, key)) {
+            match crate::value::map_find(entries, key) {
                 Ok(i) => {
                     let mut out = entries.to_vec();
                     out[i].1 = args[2].normalize()?;
@@ -271,7 +271,7 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             let key = args[1].normalize()?;
             let value = args[2].normalize()?;
             let mut out = entries.to_vec();
-            match out.binary_search_by(|(k, _)| value_cmp(*k, key)) {
+            match crate::value::map_find(&out, key) {
                 Ok(i) => out[i].1 = value,
                 Err(i) => out.insert(i, (key, value)),
             }
