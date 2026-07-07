@@ -205,3 +205,8 @@ module main {
   run randomWalkTest =
     init.then(15.reps(_ => step)).expect(mutex)
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import lamport_mutex(N = 4, MaxClock = 3).*
+}

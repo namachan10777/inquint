@@ -162,3 +162,8 @@ module reliable_broadcast {
 module main {
   import reliable_broadcast(N = 3, Faulty = Set(1)).*
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import reliable_broadcast(N = 10, Faulty = Set(1, 2)).*
+}

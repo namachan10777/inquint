@@ -180,3 +180,13 @@ module main {
     MaxBallot = 2
   ).*
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import paxos(
+    Acceptors = Set("a1", "a2", "a3"),
+    Values = Set(1, 2),
+    Quorums = Set(Set("a1", "a2"), Set("a1", "a3"), Set("a2", "a3")),
+    MaxBallot = 4
+  ).*
+}

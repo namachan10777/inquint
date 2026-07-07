@@ -146,3 +146,8 @@ module dining_fixed {
 module dining_naive {
   import dining(N = 3, fixLast = false) as naive
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import dining(N = 12, fixLast = true).*
+}

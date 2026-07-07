@@ -191,3 +191,8 @@ module main {
   run randomWalkTest =
     init.then(12.reps(_ => step)).expect(consistency)
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import two_phase_commit(RMs = Set("rm1", "rm2", "rm3", "rm4", "rm5", "rm6", "rm7", "rm8")).*
+}

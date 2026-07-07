@@ -99,3 +99,8 @@ module clock_sync {
 module main {
   import clock_sync(N = 3, MaxSkew = 2, MaxClock = 6).*
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import clock_sync(N = 6, MaxSkew = 5, MaxClock = 40).*
+}

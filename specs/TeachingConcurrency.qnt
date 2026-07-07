@@ -115,3 +115,9 @@ module main {
   run correctnessAfterStutterTest =
     init.then(8.reps(_ => step)).expect(correctness)
 }
+
+// Larger instance for benchmarking explicit-state checkers (not used by
+// the Apalache/TLC checks in specs/check.sh).
+module bench {
+  import teaching_concurrency(N = 8).*
+}

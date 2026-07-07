@@ -55,6 +55,15 @@ Notes on scope:
   the upstream quint examples. TLC properties run on the election-only
   instance (`MaxLogLen = 0`).
 
+## Bench instances
+
+Each spec additionally defines a `module bench` — a much larger instance
+(e.g. Raft with 5 terms, dining with 12 philosophers, 2PC with 8 RMs) used
+as a performance benchmark by the quintck explicit-state checker
+(`quintck-bench.sh` at the repo root; each bench is sized to take roughly
+a minute unoptimized). These instances are **not** part of `check.sh`:
+they are far too large for Apalache/TLC.
+
 ## Language feature coverage
 
 | Quint feature | Showcased in |

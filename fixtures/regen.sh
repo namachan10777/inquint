@@ -40,6 +40,25 @@ gen Paxos.json specs/Paxos.qnt --main=main \
 gen Raft.json specs/Raft.qnt --main=raft_3 \
   --invariant=electionSafety,logMatching,voteIntegrity,brokenNoLeader,brokenAtMostOneCandidate
 
+# Benchmark instances (module bench in each spec): much larger parameters,
+# sized so each takes on the order of a minute with the v1 checker. Only
+# checked by quintck (quintck-bench.sh) — too large for Apalache/TLC.
+benchgen() { # benchgen <name> <invariants>
+  local out="fixtures/bench_$1"
+  echo "generating $out.json"
+  quint compile --target=json "specs/$1.qnt" --main=bench --invariant="$2" > "$out.json"
+}
+benchgen TeachingConcurrency correctness
+benchgen ClockSync skewOK
+benchgen TwoPhaseCommit consistency
+benchgen ReadersWriters safety
+benchgen TwoLayeredCache cleanConsistency,dirtyInL1
+benchgen DiningPhilosophers consistent
+benchgen ReliableBroadcast validity,relayedBeforeDelivered
+benchgen LamportMutex mutex,requestConsistency
+benchgen Paxos agreement,oneValuePerBallot
+benchgen Raft electionSafety,logMatching,voteIntegrity
+
 # Upstream evaluator fixtures, for parser coverage of specs we didn't write.
 for f in simple tictactoe ewd426 ewd840; do
   echo "copying $f.json from quint/evaluator/fixtures"

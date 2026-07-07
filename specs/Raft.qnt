@@ -257,3 +257,13 @@ module raft_election {
     Values = Set(1)
   ).*
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import raft(
+    Servers = Set("s1", "s2", "s3"),
+    MaxTerm = 5,
+    MaxLogLen = 3,
+    Values = Set(1, 2)
+  ).*
+}

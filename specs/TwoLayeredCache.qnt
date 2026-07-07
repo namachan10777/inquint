@@ -143,3 +143,8 @@ module two_layered_cache {
 module main {
   import two_layered_cache(MaxVer = 3).*
 }
+
+// Larger instance for benchmarking explicit-state checkers.
+module bench {
+  import two_layered_cache(MaxVer = 80).*
+}
