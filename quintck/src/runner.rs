@@ -10,8 +10,6 @@ use crate::eval::Env;
 use crate::state::VarTable;
 use crate::vm::Lowerer;
 use quint_ast::{CompiledOutput, Declaration, OpQualifier, QuintName};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// Backstop against runaway choice trees.
 const MAX_PATHS: u64 = 1 << 22;
@@ -51,15 +49,16 @@ pub fn run_tests(out: &CompiledOutput, names: &[String]) -> Result<Vec<TestRepor
     }
 
     let mut compiler = Lowerer::new(&out.table, &vars);
-    let compiled: Vec<(QuintName, crate::eval::CompiledExpr)> = selected
+    let compiled: Vec<(QuintName, crate::vm::FnId)> = selected
         .iter()
         .map(|op| (op.name, compiler.compile(&op.expr)))
         .collect();
-    let storage = compiler.storage();
+    let program = compiler.finish();
+    let mut vm = crate::vm::Vm::new(&program);
 
     let mut reports = Vec::new();
-    for (name, expr) in compiled {
-        let ctl = Rc::new(RefCell::new(ChoiceCtl::new()));
+    for (name, fnid) in compiled {
+        let mut ctl = ChoiceCtl::new();
         let mut paths: u64 = 0;
         let result = loop {
             paths += 1;
@@ -69,18 +68,18 @@ pub fn run_tests(out: &CompiledOutput, names: &[String]) -> Result<Vec<TestRepor
                     format!("more than {MAX_PATHS} nondeterministic paths in run {name}"),
                 ));
             }
-            storage.borrow().clear_current();
-            storage.borrow().reset_next();
-            let mut env = Env::new(storage.clone(), Some(ctl.clone()));
+            vm.clear_current();
+            vm.reset_next();
+            let mut env = Env::new(Some(&mut ctl));
             env.any_fallthrough = true;
-            match expr.execute(&mut env) {
+            match vm.run(&mut env, fnid) {
                 Err(e) => break Err(e),
                 Ok(v) if !v.as_bool() => {
                     break Err(QuintError::new("QNT511", "Test returned false"))
                 }
                 Ok(_) => {}
             }
-            if !ctl.borrow_mut().advance() {
+            if !ctl.advance() {
                 break Ok(paths);
             }
         };

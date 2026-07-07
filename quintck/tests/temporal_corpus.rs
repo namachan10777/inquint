@@ -31,6 +31,7 @@ fn cfg(deadlock: bool) -> CheckConfig {
         deadlock,
         max_states: None,
         exact_states: false,
+        ..CheckConfig::default()
     }
 }
 

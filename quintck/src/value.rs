@@ -29,13 +29,15 @@
 
 use crate::error::{overflow, unsupported, QuintError};
 use quint_ast::{QuintName, Symbol};
+use quint_ast::slab::Slab;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::{LazyLock, Mutex};
 
 /// Enumeration guard: symbolic sets larger than this refuse to materialize.
 /// TODO(v2): make configurable via CLI (--max-enum-size).
@@ -99,10 +101,12 @@ impl std::hash::Hash for RecordShape {
     }
 }
 
-/// A compiled lambda: shared parameter registers plus the VM function id
-/// of the body. Created once per `Lambda` IR node at lowering time.
+/// A compiled lambda: the body's VM function id plus its parameter slots
+/// (bound in the per-worker parameter bank). Created once per `Lambda`
+/// IR node at lowering time; contains no shared mutable state, so the
+/// store stays Send + Sync.
 pub struct LambdaVal {
-    pub registers: Vec<Rc<Cell<Option<Value>>>>,
+    pub slots: Box<[u32]>,
     pub fnid: crate::vm::FnId,
 }
 
@@ -121,14 +125,29 @@ struct Entry {
     data: &'static ValueData,
 }
 
+/// The process-global concurrent value store.
+///
+/// Reads (`data()`, order keys, comparisons) are lock-free through the
+/// append-only [`Slab`]. Interning goes through a per-thread cache first
+/// (same cost as the old thread-local store on a hit); a cache miss takes
+/// one shard mutex. Truly new values additionally claim an id from the
+/// global counter — the only cross-thread write traffic on the hot path.
 struct ValueStore {
-    /// Intern table: stores only ids; hashing/comparison read `entries`.
-    /// Lookups take borrowed slices (see `intern_seq` etc.), so an intern
-    /// *hit* — the common case — allocates nothing.
-    map: hashbrown::HashTable<Value>,
-    entries: Vec<Entry>,
-    shapes: FxHashMap<&'static [Symbol], &'static RecordShape>,
-    lambdas: Vec<&'static LambdaVal>,
+    /// Intern tables sharded by hash: stores only ids; hashing/comparison
+    /// read `entries`. Lookups take borrowed slices (see `intern_seq`
+    /// etc.), so an intern *hit* — the common case — allocates nothing.
+    shards: [Mutex<hashbrown::HashTable<Value>>; N_SHARDS],
+    entries: Slab<Entry>,
+    len: AtomicU32,
+    shapes: Mutex<FxHashMap<&'static [Symbol], &'static RecordShape>>,
+    lambdas: Slab<&'static LambdaVal>,
+    lambdas_len: Mutex<u32>,
+}
+
+const N_SHARDS: usize = 64;
+
+fn shard_of(hash: u64) -> usize {
+    (hash >> 57) as usize & (N_SHARDS - 1)
 }
 
 /// Sentinel key for lambdas and symbolic set forms: comparing those is a
@@ -238,15 +257,17 @@ const INT_BASE: u32 = 3; // id of SMALL_INT_MIN
 
 /// Ids of symbolic set forms carry this tag bit, so `is_symbolic` (and the
 /// `normalize` fast path, hit on every assignment) needs no store access.
-const SYMBOLIC_BIT: u32 = 1 << 31;
+pub(crate) const SYMBOLIC_BIT: u32 = 1 << 31;
 
 impl ValueStore {
     fn new() -> Self {
-        let mut store = ValueStore {
-            map: hashbrown::HashTable::new(),
-            entries: Vec::new(),
-            shapes: FxHashMap::default(),
-            lambdas: Vec::new(),
+        let store = ValueStore {
+            shards: [const { Mutex::new(hashbrown::HashTable::new()) }; N_SHARDS],
+            entries: Slab::new(),
+            len: AtomicU32::new(0),
+            shapes: Mutex::new(FxHashMap::default()),
+            lambdas: Slab::new(),
+            lambdas_len: Mutex::new(0),
         };
         let f = store.intern(ValueData::Bool(false));
         let t = store.intern(ValueData::Bool(true));
@@ -258,9 +279,15 @@ impl ValueStore {
         store
     }
 
+    /// The entry of an interned value (lock-free).
+    #[inline]
+    fn entry(&self, v: Value) -> &Entry {
+        self.entries.get(v.index() as u32)
+    }
+
     /// Order key of an interned child value.
     fn key_of(&self, v: Value) -> u64 {
-        self.entries[v.index()].key
+        self.entry(v).key
     }
 
     /// Compute the order-preserving digest for a node whose children are
@@ -295,103 +322,138 @@ impl ValueStore {
         }
     }
 
-    /// Register a freshly interned node under a precomputed hash.
-    fn insert_new(&mut self, hash: u64, data: ValueData) -> Value {
-        let symbolic = data.is_symbolic();
-        let key = self.compute_order_key(&data);
-        let leaked: &'static ValueData = Box::leak(Box::new(data));
-        let index = self.entries.len() as u32 + 1;
-        assert!(index < SYMBOLIC_BIT, "value store overflow");
-        let bits = if symbolic { index | SYMBOLIC_BIT } else { index };
-        let id = Value(NonZeroU32::new(bits).unwrap());
-        self.entries.push(Entry { key, data: leaked });
-        let entries = &self.entries;
-        self.map
-            .insert_unique(hash, id, |&v| hash_data(entries[v.index()].data));
+    /// The intern core: thread-local cache → hash shard → fresh insert.
+    ///
+    /// Publication protocol: a fresh entry is written into the slab while
+    /// holding the shard lock, before the id is inserted into the shard
+    /// map — every path an id can travel to another thread (shard map
+    /// lookup, containment in a later entry, frontier handoff) is
+    /// separated from the slab write by at least one release/acquire edge.
+    fn lookup_or_insert(
+        &self,
+        hash: u64,
+        eq: impl Fn(&ValueData) -> bool,
+        make: impl FnOnce() -> ValueData,
+    ) -> Value {
+        let cached = CACHE.with_borrow(|c| {
+            c.find(hash, |&v| eq(self.entry(v).data)).copied()
+        });
+        if let Some(id) = cached {
+            return id;
+        }
+        let id = {
+            let mut map = self.shards[shard_of(hash)].lock().unwrap();
+            match map.find(hash, |&v| eq(self.entry(v).data)) {
+                Some(&id) => id,
+                None => {
+                    let data = make();
+                    let symbolic = data.is_symbolic();
+                    let key = self.compute_order_key(&data);
+                    let leaked: &'static ValueData = Box::leak(Box::new(data));
+                    let index = self.len.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    assert!(index < SYMBOLIC_BIT, "value store overflow");
+                    // Safety: `index` was claimed uniquely above; the slot
+                    // is published by the shard unlock below.
+                    unsafe { self.entries.write(index - 1, Entry { key, data: leaked }) };
+                    let bits = if symbolic { index | SYMBOLIC_BIT } else { index };
+                    let id = Value(NonZeroU32::new(bits).unwrap());
+                    map.insert_unique(hash, id, |&v| hash_data(self.entry(v).data));
+                    id
+                }
+            }
+        };
+        CACHE.with_borrow_mut(|c| {
+            c.insert_unique(hash, id, |&v| hash_data(self.entry(v).data));
+        });
         id
     }
 
-    fn intern(&mut self, data: ValueData) -> Value {
+    fn intern(&self, data: ValueData) -> Value {
         let hash = hash_data(&data);
-        let entries = &self.entries;
-        if let Some(&id) = self.map.find(hash, |&v| *entries[v.index()].data == data) {
-            return id;
-        }
-        self.insert_new(hash, data)
+        // eq reads the not-yet-moved data; make takes it — it rides in a
+        // RefCell so both closures can capture it by shared reference.
+        let data = RefCell::new(Some(data));
+        self.lookup_or_insert(
+            hash,
+            |cand| data.borrow().as_ref() == Some(cand),
+            || data.borrow_mut().take().unwrap(),
+        )
     }
 
     /// Intern a sequence container from a borrowed slice: nothing is
     /// allocated on a hit.
-    fn intern_seq(&mut self, kind: SeqKind, elems: &[Value]) -> Value {
+    fn intern_seq(&self, kind: SeqKind, elems: &[Value]) -> Value {
         let hash = hash_seq(kind, elems);
-        let entries = &self.entries;
-        let found = self.map.find(hash, |&v| match (kind, entries[v.index()].data) {
-            (SeqKind::Set, ValueData::Set(s)) => &**s == elems,
-            (SeqKind::Tuple, ValueData::Tuple(s)) => &**s == elems,
-            (SeqKind::List, ValueData::List(s)) => &**s == elems,
-            (SeqKind::CrossProduct, ValueData::CrossProduct(s)) => &**s == elems,
-            _ => false,
-        });
-        if let Some(&id) = found {
-            return id;
-        }
-        let data = match kind {
-            SeqKind::Set => ValueData::Set(elems.into()),
-            SeqKind::Tuple => ValueData::Tuple(elems.into()),
-            SeqKind::List => ValueData::List(elems.into()),
-            SeqKind::CrossProduct => ValueData::CrossProduct(elems.into()),
-        };
-        self.insert_new(hash, data)
+        self.lookup_or_insert(
+            hash,
+            |cand| match (kind, cand) {
+                (SeqKind::Set, ValueData::Set(s)) => &**s == elems,
+                (SeqKind::Tuple, ValueData::Tuple(s)) => &**s == elems,
+                (SeqKind::List, ValueData::List(s)) => &**s == elems,
+                (SeqKind::CrossProduct, ValueData::CrossProduct(s)) => &**s == elems,
+                _ => false,
+            },
+            || match kind {
+                SeqKind::Set => ValueData::Set(elems.into()),
+                SeqKind::Tuple => ValueData::Tuple(elems.into()),
+                SeqKind::List => ValueData::List(elems.into()),
+                SeqKind::CrossProduct => ValueData::CrossProduct(elems.into()),
+            },
+        )
     }
 
-    fn intern_map(&mut self, pairs: &[(Value, Value)]) -> Value {
+    fn intern_map(&self, pairs: &[(Value, Value)]) -> Value {
         let hash = hash_map_entries(pairs);
-        let entries = &self.entries;
-        let found = self.map.find(hash, |&v| match entries[v.index()].data {
-            ValueData::Map(m) => &**m == pairs,
-            _ => false,
-        });
-        if let Some(&id) = found {
-            return id;
-        }
-        self.insert_new(hash, ValueData::Map(pairs.into()))
+        self.lookup_or_insert(
+            hash,
+            |cand| match cand {
+                ValueData::Map(m) => &**m == pairs,
+                _ => false,
+            },
+            || ValueData::Map(pairs.into()),
+        )
     }
 
-    fn intern_record(&mut self, shape: &'static RecordShape, values: &[Value]) -> Value {
+    fn intern_record(&self, shape: &'static RecordShape, values: &[Value]) -> Value {
         let hash = hash_record(shape, values);
-        let entries = &self.entries;
-        let found = self.map.find(hash, |&v| match entries[v.index()].data {
-            ValueData::Record(s, vs) => std::ptr::eq(*s, shape) && &**vs == values,
-            _ => false,
-        });
-        if let Some(&id) = found {
-            return id;
-        }
-        self.insert_new(hash, ValueData::Record(shape, values.into()))
+        self.lookup_or_insert(
+            hash,
+            |cand| match cand {
+                ValueData::Record(s, vs) => std::ptr::eq(*s, shape) && &**vs == values,
+                _ => false,
+            },
+            || ValueData::Record(shape, values.into()),
+        )
     }
 
-    fn shape(&mut self, fields: &[Symbol]) -> &'static RecordShape {
-        if let Some(&s) = self.shapes.get(fields) {
+    fn shape(&self, fields: &[Symbol]) -> &'static RecordShape {
+        let mut shapes = self.shapes.lock().unwrap();
+        if let Some(&s) = shapes.get(fields) {
             return s;
         }
         let shape: &'static RecordShape = Box::leak(Box::new(RecordShape {
             fields: fields.into(),
         }));
-        self.shapes.insert(&shape.fields, shape);
+        shapes.insert(&shape.fields, shape);
         shape
     }
 }
 
+static GLOBAL: LazyLock<ValueStore> = LazyLock::new(ValueStore::new);
+
 thread_local! {
-    static VALUES: RefCell<ValueStore> = RefCell::new(ValueStore::new());
+    /// Per-thread intern cache in front of [`GLOBAL`]: hot values hit here
+    /// at the same cost as the old thread-local store.
+    static CACHE: RefCell<hashbrown::HashTable<Value>> =
+        const { RefCell::new(hashbrown::HashTable::new()) };
 }
 
 fn intern(data: ValueData) -> Value {
-    VALUES.with_borrow_mut(|s| s.intern(data))
+    GLOBAL.intern(data)
 }
 
 fn intern_seq(kind: SeqKind, elems: &[Value]) -> Value {
-    VALUES.with_borrow_mut(|s| s.intern_seq(kind, elems))
+    GLOBAL.intern_seq(kind, elems)
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +539,7 @@ fn value_cmp_in(s: &ValueStore, a: Value, b: Value) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
-    let (ea, eb) = (s.entries[a.index()], s.entries[b.index()]);
+    let (ea, eb) = (*s.entry(a), *s.entry(b));
     if ea.key != eb.key && ea.key != NO_ORDER_KEY && eb.key != NO_ORDER_KEY {
         return ea.key.cmp(&eb.key);
     }
@@ -487,13 +549,15 @@ fn value_cmp_in(s: &ValueStore, a: Value, b: Value) -> Ordering {
 /// Binary search over sorted map entries, one store access for the whole
 /// search (probes are mostly `u64` key compares).
 pub fn map_find(entries: &[(Value, Value)], key: Value) -> Result<usize, usize> {
-    VALUES.with_borrow(|s| entries.binary_search_by(|(k, _)| value_cmp_in(s, *k, key)))
+    let s = &*GLOBAL;
+    entries.binary_search_by(|(k, _)| value_cmp_in(s, *k, key))
 }
 
 /// Binary search over a sorted set slice, one store access for the whole
 /// search.
 pub fn set_find(elems: &[Value], needle: Value) -> Result<usize, usize> {
-    VALUES.with_borrow(|s| elems.binary_search_by(|&e| value_cmp_in(s, e, needle)))
+    let s = &*GLOBAL;
+    elems.binary_search_by(|&e| value_cmp_in(s, e, needle))
 }
 
 /// Sort values by [`value_cmp`], fetching every element's order key in a
@@ -517,20 +581,18 @@ pub(crate) fn sort_values_structural(vs: &mut [Value]) {
     }
     if n <= 16 {
         let mut pairs = [(0u64, Value::bool(false)); 16];
-        VALUES.with_borrow(|s| {
-            for (i, &v) in vs.iter().enumerate() {
-                pairs[i] = (s.entries[v.index()].key, v);
-            }
-        });
+        let s = &*GLOBAL;
+        for (i, &v) in vs.iter().enumerate() {
+            pairs[i] = (s.entry(v).key, v);
+        }
         sort_pairs(&mut pairs[..n]);
         for (dst, (_, v)) in vs.iter_mut().zip(&pairs[..n]) {
             *dst = *v;
         }
     } else {
         let mut pairs: Vec<(u64, Value)> = Vec::with_capacity(n);
-        VALUES.with_borrow(|s| {
-            pairs.extend(vs.iter().map(|&v| (s.entries[v.index()].key, v)));
-        });
+        let s = &*GLOBAL;
+        pairs.extend(vs.iter().map(|&v| (s.entry(v).key, v)));
         sort_pairs(&mut pairs);
         for (dst, (_, v)) in vs.iter_mut().zip(&pairs) {
             *dst = *v;
@@ -593,13 +655,27 @@ impl std::ops::Deref for U64Buf {
     }
 }
 
+thread_local! {
+    /// Shape lookups happen on every record construction; the global
+    /// shapes table is behind a mutex, so cache the (very few) shapes
+    /// per thread.
+    static SHAPE_CACHE: RefCell<FxHashMap<&'static [Symbol], &'static RecordShape>> =
+        RefCell::new(FxHashMap::default());
+}
+
 fn intern_shape(fields: &[Symbol]) -> &'static RecordShape {
-    VALUES.with_borrow_mut(|s| s.shape(fields))
+    let cached = SHAPE_CACHE.with_borrow(|c| c.get(fields).copied());
+    if let Some(s) = cached {
+        return s;
+    }
+    let shape = GLOBAL.shape(fields);
+    SHAPE_CACHE.with_borrow_mut(|c| c.insert(&shape.fields, shape));
+    shape
 }
 
 /// Number of interned values (diagnostics).
 pub fn store_len() -> usize {
-    VALUES.with_borrow(|s| s.entries.len())
+    GLOBAL.len.load(AtomicOrdering::Relaxed) as usize
 }
 
 impl Value {
@@ -611,7 +687,7 @@ impl Value {
     /// The interned node. `&'static`: the store is append-only and leaked.
     #[inline]
     pub fn data(self) -> &'static ValueData {
-        VALUES.with_borrow(|s| s.entries[self.index()].data)
+        GLOBAL.entry(self).data
     }
 
     /// Raw id bits, for embedding in bytecode immediates.
@@ -628,10 +704,10 @@ impl Value {
 
     pub fn as_lambda(self) -> &'static LambdaVal {
         // single store access for data + registry
-        VALUES.with_borrow(|s| match s.entries[self.index()].data {
-            ValueData::Lambda(i) => s.lambdas[*i as usize],
+        match GLOBAL.entry(self).data {
+            ValueData::Lambda(i) => GLOBAL.lambdas.get(*i),
             v => panic!("expected lambda, got {v:?}"),
-        })
+        }
     }
 }
 
@@ -704,13 +780,11 @@ pub fn value_cmp(a: Value, b: Value) -> Ordering {
     // One store access for both nodes' data + order keys. Distinct valid
     // keys decide the comparison outright (see `compute_order_key` for the
     // soundness argument); equal keys fall back to the deep compare.
-    let (da, ka, db, kb) = VALUES.with_borrow(|s| {
-        let (ia, ib) = (a.index(), b.index());
-        {
-            let (ea, eb) = (s.entries[ia], s.entries[ib]);
-            (ea.data, ea.key, eb.data, eb.key)
-        }
-    });
+    let (da, ka, db, kb) = {
+        let s = &*GLOBAL;
+        let (ea, eb) = (s.entry(a), s.entry(b));
+        (ea.data, ea.key, eb.data, eb.key)
+    };
     if ka != kb && ka != NO_ORDER_KEY && kb != NO_ORDER_KEY {
         let ord = ka.cmp(&kb);
         debug_assert_eq!(
@@ -890,7 +964,7 @@ impl Value {
     /// Record with a known shape and values in shape order (all normalized).
     pub fn record_shaped(shape: &'static RecordShape, values: &[Value]) -> Self {
         debug_assert_eq!(shape.fields.len(), values.len());
-        VALUES.with_borrow_mut(|s| s.intern_record(shape, values))
+        GLOBAL.intern_record(shape, values)
     }
 
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Result<Self, QuintError> {
@@ -907,14 +981,15 @@ impl Value {
         // Decorated sort: keys fetched once, and the original index keeps
         // the unstable sort stable per key for the last-wins dedup.
         let mut dec: Vec<(u64, u32, Value, Value)> = Vec::with_capacity(entries.len());
-        VALUES.with_borrow(|s| {
+        {
+            let s = &*GLOBAL;
             dec.extend(
                 entries
                     .iter()
                     .enumerate()
-                    .map(|(i, &(k, v))| (s.entries[k.index()].key, i as u32, k, v)),
+                    .map(|(i, &(k, v))| (s.entry(k).key, i as u32, k, v)),
             );
-        });
+        }
         dec.sort_unstable_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| value_cmp(a.2, b.2))
@@ -930,7 +1005,7 @@ impl Value {
             }
             entries.push((k, v));
         }
-        VALUES.with_borrow_mut(|s| s.intern_map(&entries))
+        GLOBAL.intern_map(&entries)
     }
 
     /// Map from pairs already sorted by key with unique keys.
@@ -938,20 +1013,28 @@ impl Value {
         debug_assert!(entries
             .windows(2)
             .all(|w| value_cmp(w[0].0, w[1].0) == Ordering::Less));
-        VALUES.with_borrow_mut(|s| s.intern_map(&entries))
+        GLOBAL.intern_map(&entries)
     }
 
     pub fn variant(label: QuintName, payload: Value) -> Result<Self, QuintError> {
         Ok(intern(ValueData::Variant(label, payload.normalize()?)))
     }
 
-    pub fn lambda(registers: Vec<Rc<Cell<Option<Value>>>>, fnid: crate::vm::FnId) -> Self {
-        VALUES.with_borrow_mut(|s| {
-            let idx = s.lambdas.len() as u32;
-            s.lambdas
-                .push(Box::leak(Box::new(LambdaVal { registers, fnid })));
-            s.intern(ValueData::Lambda(idx))
-        })
+    pub fn lambda(slots: Box<[u32]>, fnid: crate::vm::FnId) -> Self {
+        let idx = {
+            let mut len = GLOBAL.lambdas_len.lock().unwrap();
+            let idx = *len;
+            // Safety: idx claimed under the lock; published by the intern
+            // of the `Lambda(idx)` value below before the id escapes.
+            unsafe {
+                GLOBAL
+                    .lambdas
+                    .write(idx, Box::leak(Box::new(LambdaVal { slots, fnid })))
+            };
+            *len += 1;
+            idx
+        };
+        intern(ValueData::Lambda(idx))
     }
 
     pub fn interval(start: i64, end: i64) -> Self {
@@ -1469,7 +1552,7 @@ mod tests {
     use super::*;
 
     fn key(v: Value) -> u64 {
-        VALUES.with_borrow(|s| s.entries[v.index()].key)
+        GLOBAL.entry(v).key
     }
 
     /// Key soundness: for every pair with distinct valid keys, the key

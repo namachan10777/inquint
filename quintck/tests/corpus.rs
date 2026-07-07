@@ -28,6 +28,7 @@ fn cfg(max_steps: Option<u32>) -> CheckConfig {
         deadlock: true,
         max_states: None,
         exact_states: false,
+        ..CheckConfig::default()
     }
 }
 
@@ -91,11 +92,12 @@ fn expect_violation(spec: &CompiledSpec, max_steps: Option<u32>, name: &str, dep
 #[test]
 fn teaching_concurrency_successor_counts() {
     let spec = build("TeachingConcurrency.json", &["correctness"]);
-    let initial = enumerate(&spec.init, &spec.storage, None).unwrap();
+    let mut vm = spec.make_vm();
+    let initial = enumerate(&mut vm, spec.init, None).unwrap();
     assert_eq!(initial.len(), 27);
 
     let some_init = initial.first().unwrap();
-    let successors = enumerate(&spec.step, &spec.storage, Some(some_init)).unwrap();
+    let successors = enumerate(&mut vm, spec.step, Some(some_init)).unwrap();
     // 3 processes can each take a step; results are distinct states
     assert_eq!(successors.len(), 3);
 }
@@ -104,10 +106,11 @@ fn teaching_concurrency_successor_counts() {
 #[test]
 fn enumeration_is_deterministic() {
     let spec = build("TwoPhaseCommit.json", &["consistency"]);
-    let initial = enumerate(&spec.init, &spec.storage, None).unwrap();
+    let mut vm = spec.make_vm();
+    let initial = enumerate(&mut vm, spec.init, None).unwrap();
     let s = initial.first().unwrap();
-    let a = enumerate(&spec.step, &spec.storage, Some(s)).unwrap();
-    let b = enumerate(&spec.step, &spec.storage, Some(s)).unwrap();
+    let a = enumerate(&mut vm, spec.step, Some(s)).unwrap();
+    let b = enumerate(&mut vm, spec.step, Some(s)).unwrap();
     assert_eq!(a, b);
 }
 
@@ -226,4 +229,40 @@ fn itf_roundtrip() {
     let json = serde_json::to_string(&itf).unwrap();
     let parsed: itf::Trace<itf::Value> = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.states.len(), trace.len());
+}
+
+/// Parallel exploration must agree with single-threaded on the state count
+/// and verdict (the state set is schedule-independent by construction).
+#[test]
+fn parallel_agrees_with_sequential() {
+    for (fixture, inv) in [("TwoPhaseCommit.json", "consistency"), ("Paxos.json", "agreement")] {
+        let spec = build(fixture, &[inv]);
+        let seq = CheckConfig {
+            threads: 1,
+            deadlock: false,
+            ..cfg(Some(6))
+        };
+        let par = CheckConfig {
+            threads: 4,
+            deadlock: false,
+            ..cfg(Some(6))
+        };
+        let unpack = |r: Result<quintck::explorer::CheckOutcome, Box<quintck::explorer::CheckError>>, mode: &str| match r {
+            Ok(quintck::explorer::CheckOutcome::Pass { states, max_depth }) => (states, max_depth),
+            Ok(quintck::explorer::CheckOutcome::InvariantViolation { .. }) => {
+                panic!("{fixture} ({mode}): unexpected violation")
+            }
+            Ok(quintck::explorer::CheckOutcome::Deadlock { .. }) => {
+                panic!("{fixture} ({mode}): unexpected deadlock")
+            }
+            Ok(quintck::explorer::CheckOutcome::Incomplete { .. }) => {
+                panic!("{fixture} ({mode}): unexpected incomplete")
+            }
+            Err(e) => panic!("{fixture} ({mode}): error {}", e.error),
+        };
+        let (sa, da) = unpack(quintck::explorer::check(&spec, &seq), "seq");
+        let (sb, db) = unpack(quintck::explorer::check(&spec, &par), "par");
+        assert_eq!(sa, sb, "{fixture}: state count differs");
+        assert_eq!(da, db, "{fixture}: depth differs");
+    }
 }

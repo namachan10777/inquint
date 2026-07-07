@@ -12,22 +12,21 @@
 //! register-file slots without clearing them between calls.
 
 use super::builtins::vm_builtin;
-use super::{BuiltinCall, Chunk, FnId, Instr, MatchTable, Op, Program, Vm};
-use crate::eval::CompiledExpr;
-use crate::state::{Register, VarStorage, VarTable};
-use crate::value::Value;
+use super::{BuiltinCall, CallSite, Chunk, FnId, Instr, MatchTable, Op, Program, Vm};
+use crate::eval::{BoundExpr, Env};
+use crate::state::VarTable;
+use crate::value::{EvalResult, Value};
 use quint_ast::{
     Declaration, LambdaParam, LookupDefinition, LookupTable, OpDef, OpQualifier, QuintEx, QuintId,
+    Symbol,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub struct Lowerer<'t> {
     table: &'t LookupTable,
-    pub storage: Rc<RefCell<VarStorage>>,
+    /// The program under construction (immutable once `finish`ed).
+    program: Program,
     var_index: FxHashMap<QuintId, usize>,
-    vm: Rc<RefCell<Vm>>,
     param_slots: FxHashMap<QuintId, u32>,
     let_cells: FxHashMap<QuintId, u32>,
     def_refs: FxHashMap<QuintId, DefRef>,
@@ -75,6 +74,8 @@ struct FnB {
     branch_tables: Vec<Box<[u16]>>,
     match_tables: Vec<MatchTable>,
     builtin_calls: Vec<BuiltinCall>,
+    call_sites: Vec<CallSite>,
+    field_syms: Vec<Symbol>,
 }
 
 impl FnB {
@@ -89,6 +90,8 @@ impl FnB {
             branch_tables: Vec::new(),
             match_tables: Vec::new(),
             builtin_calls: Vec::new(),
+            call_sites: Vec::new(),
+            field_syms: Vec::new(),
         }
     }
 
@@ -134,6 +137,8 @@ impl FnB {
             branch_tables: self.branch_tables,
             match_tables: self.match_tables,
             builtin_calls: self.builtin_calls,
+            call_sites: self.call_sites,
+            field_syms: self.field_syms,
         }
     }
 }
@@ -142,23 +147,29 @@ fn u16_of(n: usize, what: &str) -> u16 {
     u16::try_from(n).unwrap_or_else(|_| panic!("{what} overflows the VM's 16-bit operand"))
 }
 
+/// CallValue packs (argbase, nargs) into the c operand so the JIT can
+/// stage the arguments without runtime arity discovery.
+fn pack_callvalue(argbase: u16, nargs: usize) -> u16 {
+    assert!(argbase < (1 << 11), "argbase overflows CallValue encoding");
+    assert!(nargs <= crate::vm::MAX_PARAMS, "too many call arguments");
+    (argbase << 5) | nargs as u16
+}
+
 impl<'t> Lowerer<'t> {
     pub fn new(table: &'t LookupTable, vars: &VarTable) -> Self {
-        let storage = Rc::new(RefCell::new(VarStorage::new(vars)));
         let program = Program {
             funcs: Vec::new(),
-            params: Vec::new(),
             param_names: Vec::new(),
-            var_current: storage.borrow().current.clone(),
-            var_next: storage.borrow().next.clone(),
             var_names: vars.names.clone(),
+            n_let_cells: 0,
+            n_val_cells: 0,
+            n_pure_cells: 0,
             errors: Vec::new(),
         };
         Lowerer {
             table,
-            storage,
+            program,
             var_index: vars.by_def_id.clone(),
-            vm: Rc::new(RefCell::new(Vm::new(program))),
             param_slots: FxHashMap::default(),
             let_cells: FxHashMap::default(),
             def_refs: FxHashMap::default(),
@@ -258,19 +269,31 @@ impl<'t> Lowerer<'t> {
         info
     }
 
-    pub fn vm_handle(&self) -> Rc<RefCell<Vm>> {
-        self.vm.clone()
+    /// Hand over the finished (immutable) program.
+    pub fn finish(self) -> Program {
+        self.program
     }
 
-    fn param_slot(&mut self, param: &LambdaParam) -> u32 {
+    /// Evaluate a state-independent expression during lowering (temporal
+    /// quantifier domains): runs a throwaway Vm over the program built so
+    /// far, with the given parameter bindings installed.
+    pub fn eval_bound(&self, fnid: FnId, bindings: &[(u32, Value)]) -> EvalResult {
+        let mut vm = Vm::new(&self.program);
+        let be = BoundExpr {
+            fnid,
+            bindings: bindings.to_vec(),
+        };
+        let mut env = Env::new(None);
+        be.eval(&mut vm, &mut env)
+    }
+
+
+    pub fn param_slot(&mut self, param: &LambdaParam) -> u32 {
         if let Some(&s) = self.param_slots.get(&param.id) {
             return s;
         }
-        let mut vm = self.vm.borrow_mut();
-        let slot = vm.program.params.len() as u32;
-        vm.program.params.push(Rc::new(std::cell::Cell::new(None)));
-        vm.program.param_names.push(param.name);
-        drop(vm);
+        let slot = self.program.param_names.len() as u32;
+        self.program.param_names.push(param.name);
         self.param_slots.insert(param.id, slot);
         slot
     }
@@ -279,15 +302,15 @@ impl<'t> Lowerer<'t> {
         if let Some(&c) = self.let_cells.get(&id) {
             return c;
         }
-        let cell = self.vm.borrow_mut().add_let_cell();
+        let cell = self.program.n_let_cells as u32;
+        self.program.n_let_cells += 1;
         self.let_cells.insert(id, cell);
         cell
     }
 
     fn error_idx(&mut self, code: &'static str, msg: String) -> u16 {
-        let mut vm = self.vm.borrow_mut();
-        vm.program.errors.push((code, msg));
-        u16_of(vm.program.errors.len() - 1, "error table")
+        self.program.errors.push((code, msg));
+        u16_of(self.program.errors.len() - 1, "error table")
     }
 
     /// Lower an expression as a zero-parameter function (memoized).
@@ -307,9 +330,8 @@ impl<'t> Lowerer<'t> {
         f.cur_node = expr.id();
         f.emit(Op::Ret, dst, 0, 0);
         let chunk = f.finish();
-        let mut vm = self.vm.borrow_mut();
-        vm.program.funcs.push(Rc::new(chunk));
-        u16_of(vm.program.funcs.len() - 1, "function table") as FnId
+        self.program.funcs.push(chunk);
+        u16_of(self.program.funcs.len() - 1, "function table") as FnId
     }
 
     /// The interned lambda constant for a `Lambda` literal (body lowered
@@ -325,14 +347,7 @@ impl<'t> Lowerer<'t> {
         assert!(params.len() <= super::MAX_PARAMS, "too many lambda params");
         let slots: Vec<u32> = params.iter().map(|p| self.param_slot(p)).collect();
         let fnid = self.lower_fn(body, slots.clone());
-        let registers: Vec<Register> = {
-            let vm = self.vm.borrow();
-            slots
-                .iter()
-                .map(|&s| vm.program.params[s as usize].clone())
-                .collect()
-        };
-        let value = Value::lambda(registers, fnid);
+        let value = Value::lambda(slots.into_boxed_slice(), fnid);
         self.lambda_memo.insert(id, (value, fnid));
         (value, fnid)
     }
@@ -349,11 +364,15 @@ impl<'t> Lowerer<'t> {
             match op.qualifier {
                 OpQualifier::Val => {
                     let f = self.lower_fn(&op.expr, Vec::new());
-                    DefRef::CachedVal(f, self.vm.borrow_mut().add_val_cell())
+                    let cell = self.program.n_val_cells as u32;
+                    self.program.n_val_cells += 1;
+                    DefRef::CachedVal(f, cell)
                 }
                 OpQualifier::PureVal => {
                     let f = self.lower_fn(&op.expr, Vec::new());
-                    DefRef::CachedPure(f, self.vm.borrow_mut().add_pure_cell())
+                    let cell = self.program.n_pure_cells as u32;
+                    self.program.n_pure_cells += 1;
+                    DefRef::CachedPure(f, cell)
                 }
                 _ => DefRef::Fn(self.lower_fn(&op.expr, Vec::new())),
             }
@@ -384,7 +403,8 @@ impl<'t> Lowerer<'t> {
             LookupDefinition::Definition(Declaration::OpDef(op)) => match self.def_ref(op) {
                 DefRef::Lambda(v, _) => self.emit_load_imm(f, dst, v),
                 DefRef::Fn(fnid) => {
-                    f.emit(Op::Call, dst, u16_of(fnid as usize, "fn id"), 0);
+                    let cs = self.call_site(f, fnid);
+                    f.emit(Op::Call, dst, cs, 0);
                 }
                 DefRef::CachedLet(fnid, cell) => {
                     f.emit(
@@ -522,25 +542,48 @@ impl<'t> Lowerer<'t> {
             }
 
             "implies" => {
-                self.lower_into(f, &args[0], dst);
-                let j_false = f.emit(Op::JumpIfFalse, dst, 0, 0);
-                self.lower_into(f, &args[1], dst);
-                let j_join = f.emit(Op::Jump, 0, 0, 0);
-                f.patch_b(j_false, f.pc());
-                self.emit_load_imm(f, dst, Value::bool(true));
-                let join = f.pc();
-                f.patch_b(j_join, join);
+                let mut guards = Vec::new();
+                if !self.try_lower_guard(f, &args[0], &mut guards) {
+                    self.lower_into(f, &args[0], dst);
+                    guards.clear();
+                    let j_false = f.emit(Op::JumpIfFalse, dst, 0, 0);
+                    self.lower_into(f, &args[1], dst);
+                    let j_join = f.emit(Op::Jump, 0, 0, 0);
+                    f.patch_b(j_false, f.pc());
+                    self.emit_load_imm(f, dst, Value::bool(true));
+                    f.patch_b(j_join, f.pc());
+                } else {
+                    self.lower_into(f, &args[1], dst);
+                    let j_join = f.emit(Op::Jump, 0, 0, 0);
+                    let vac = f.pc();
+                    for g in guards {
+                        f.patch_c(g, vac);
+                    }
+                    self.emit_load_imm(f, dst, Value::bool(true));
+                    f.patch_b(j_join, f.pc());
+                }
             }
 
             "ite" => {
-                self.lower_into(f, &args[0], dst);
-                let j_else = f.emit(Op::JumpIfFalse, dst, 0, 0);
-                self.lower_into(f, &args[1], dst);
-                let j_join = f.emit(Op::Jump, 0, 0, 0);
-                f.patch_b(j_else, f.pc());
-                self.lower_into(f, &args[2], dst);
-                let join = f.pc();
-                f.patch_b(j_join, join);
+                let mut guards = Vec::new();
+                if self.try_lower_guard(f, &args[0], &mut guards) {
+                    self.lower_into(f, &args[1], dst);
+                    let j_join = f.emit(Op::Jump, 0, 0, 0);
+                    let els = f.pc();
+                    for g in guards {
+                        f.patch_c(g, els);
+                    }
+                    self.lower_into(f, &args[2], dst);
+                    f.patch_b(j_join, f.pc());
+                } else {
+                    self.lower_into(f, &args[0], dst);
+                    let j_else = f.emit(Op::JumpIfFalse, dst, 0, 0);
+                    self.lower_into(f, &args[1], dst);
+                    let j_join = f.emit(Op::Jump, 0, 0, 0);
+                    f.patch_b(j_else, f.pc());
+                    self.lower_into(f, &args[2], dst);
+                    f.patch_b(j_join, f.pc());
+                }
             }
 
             "actionAll" => self.lower_action_all(f, args, dst),
@@ -629,22 +672,82 @@ impl<'t> Lowerer<'t> {
         }
     }
 
+    /// Resolve a static call target into a call-site table entry with the
+    /// callee's parameter slots pre-copied.
+    fn call_site(&mut self, f: &mut FnB, fnid: FnId) -> u16 {
+        let slots = self.program.funcs[fnid as usize].param_slots.clone();
+        f.call_sites.push(CallSite { fnid, slots });
+        u16_of(f.call_sites.len() - 1, "call site table")
+    }
+
+    /// Fused guard: if `expr` is a two-argument comparison builtin, lower
+    /// its operands and emit a single Guard instruction that jumps to the
+    /// (to-be-patched, via `patch_c`) else-target when the comparison is
+    /// false. Returns false when the expression doesn't match.
+    fn try_lower_guard(&mut self, f: &mut FnB, expr: &QuintEx, guard_jumps: &mut Vec<usize>) -> bool {
+        let QuintEx::App { id, opcode, args } = expr else {
+            return false;
+        };
+        if args.len() != 2 || self.table.get(id).is_some() {
+            return false; // user-defined op shadowing a builtin name
+        }
+        let op = match opcode.as_str() {
+            "eq" => Op::GuardEq,
+            "neq" => Op::GuardNeq,
+            "ilt" => Op::GuardLt,
+            "ilte" => Op::GuardLte,
+            "igt" => Op::GuardGt,
+            "igte" => Op::GuardGte,
+            _ => return false,
+        };
+        let saved_node = f.cur_node;
+        f.cur_node = expr.id();
+        let mark = f.next_reg;
+        let rx = f.alloc(1);
+        self.lower_into(f, &args[0], rx);
+        let ry = f.alloc(1);
+        self.lower_into(f, &args[1], ry);
+        guard_jumps.push(f.emit(op, rx, ry, 0));
+        f.free_to(mark);
+        f.cur_node = saved_node;
+        true
+    }
+
     /// Short-circuit conjunction (empty ⇒ true).
     fn lower_and(&mut self, f: &mut FnB, args: &[QuintEx], dst: u16) {
         if args.is_empty() {
             self.emit_load_imm(f, dst, Value::bool(true));
             return;
         }
-        let mut jumps = Vec::new();
+        let mut jumps = Vec::new(); // JumpIfFalse (dst already false)
+        let mut guards = Vec::new(); // fused Guard* (dst not written)
         for (i, arg) in args.iter().enumerate() {
+            if i + 1 < args.len() && self.try_lower_guard(f, arg, &mut guards) {
+                continue;
+            }
             self.lower_into(f, arg, dst);
             if i + 1 < args.len() {
                 jumps.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
             }
         }
-        let join = f.pc();
-        for j in jumps {
-            f.patch_b(j, join);
+        if guards.is_empty() {
+            let join = f.pc();
+            for j in jumps {
+                f.patch_b(j, join);
+            }
+        } else {
+            // fused guards need a false-trampoline (they don't write dst)
+            let j_ok = f.emit(Op::Jump, 0, 0, 0);
+            let false_pc = f.pc();
+            for g in guards {
+                f.patch_c(g, false_pc);
+            }
+            self.emit_load_imm(f, dst, Value::bool(false));
+            let join = f.pc();
+            f.patch_b(j_ok, join);
+            for j in jumps {
+                f.patch_b(j, join);
+            }
         }
     }
 
@@ -656,8 +759,13 @@ impl<'t> Lowerer<'t> {
             return;
         }
         f.emit(Op::SnapNext, 0, 0, 0);
-        let mut fails = Vec::new();
-        for arg in args {
+        let mut fails = Vec::new(); // JumpIfFalse
+        let mut guards = Vec::new(); // fused Guard*
+        let last = args.len() - 1;
+        for (i, arg) in args.iter().enumerate() {
+            if i < last && self.try_lower_guard(f, arg, &mut guards) {
+                continue;
+            }
             self.lower_into(f, arg, dst);
             fails.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
         }
@@ -667,7 +775,11 @@ impl<'t> Lowerer<'t> {
         for j in fails {
             f.patch_b(j, rollback);
         }
-        // dst is already false on this path
+        for g in guards {
+            f.patch_c(g, rollback);
+        }
+        // fused guards don't write dst, so set false explicitly here
+        self.emit_load_imm(f, dst, Value::bool(false));
         f.emit(Op::RestoreSnapPop, 0, 0, 0);
         let join = f.pc();
         f.patch_b(j_join, join);
@@ -709,7 +821,7 @@ impl<'t> Lowerer<'t> {
                     let m = f.next_reg;
                     let r_lam = f.alloc(1);
                     self.lower_into(f, elim, r_lam);
-                    f.emit(Op::CallValue, dst, r_lam, r_payload);
+                    f.emit(Op::CallValue, dst, r_lam, pack_callvalue(r_payload, 1));
                     f.free_to(m);
                 }
             }
@@ -753,14 +865,49 @@ impl<'t> Lowerer<'t> {
                 };
                 match direct {
                     Some(fnid) => {
-                        f.emit(Op::Call, dst, u16_of(fnid as usize, "fn id"), ab);
+                        let cs = self.call_site(f, fnid);
+                        f.emit(Op::Call, dst, cs, ab);
                     }
                     None => {
                         let r_lam = f.alloc(1);
                         self.lower_def_value(f, &def, r_lam);
-                        f.emit(Op::CallValue, dst, r_lam, ab);
+                        f.emit(Op::CallValue, dst, r_lam, pack_callvalue(ab, args.len()));
                     }
                 }
+                f.free_to(mark);
+            }
+            // Fused eager builtins: dedicated opcodes skip the call-site
+            // machinery entirely.
+            None if matches!(opcode, "eq" | "neq") && args.len() == 2 => {
+                let mark = f.next_reg;
+                let rx = f.alloc(1);
+                self.lower_into(f, &args[0], rx);
+                let ry = f.alloc(1);
+                self.lower_into(f, &args[1], ry);
+                let op = if opcode == "eq" { Op::Eq } else { Op::Neq };
+                f.emit(op, dst, rx, ry);
+                f.free_to(mark);
+            }
+            None if opcode == "not" && args.len() == 1 => {
+                let mark = f.next_reg;
+                let rx = f.alloc(1);
+                self.lower_into(f, &args[0], rx);
+                f.emit(Op::Not, dst, rx, 0);
+                f.free_to(mark);
+            }
+            None if opcode == "field"
+                && args.len() == 2
+                && matches!(&args[1], QuintEx::Str { .. }) =>
+            {
+                let QuintEx::Str { value: sym, .. } = &args[1] else {
+                    unreachable!()
+                };
+                let mark = f.next_reg;
+                let r_rec = f.alloc(1);
+                self.lower_into(f, &args[0], r_rec);
+                let idx = u16_of(f.field_syms.len(), "field symbol table");
+                f.field_syms.push(*sym);
+                f.emit(Op::RecField, dst, r_rec, idx);
                 f.free_to(mark);
             }
             // Eager builtin
@@ -825,7 +972,11 @@ impl<'t> Lowerer<'t> {
                         }
                     }
                     let mut disabled_jumps = Vec::new();
+                    let mut disabled_guards = Vec::new();
                     for arg in &conj_args[..hoist] {
+                        if self.try_lower_guard(f, arg, &mut disabled_guards) {
+                            continue;
+                        }
                         self.lower_into(f, arg, dst);
                         disabled_jumps.push(f.emit(Op::JumpIfFalse, dst, 0, 0));
                     }
@@ -843,6 +994,9 @@ impl<'t> Lowerer<'t> {
                     f.patch_c(bind, disabled);
                     for j in disabled_jumps {
                         f.patch_b(j, disabled);
+                    }
+                    for g in disabled_guards {
+                        f.patch_c(g, disabled);
                     }
                     self.emit_load_imm(f, dst, Value::bool(false));
                     let join = f.pc();
@@ -864,20 +1018,8 @@ impl<'t> Lowerer<'t> {
 }
 
 impl Lowerer<'_> {
-    pub fn compile(&mut self, expr: &QuintEx) -> CompiledExpr {
-        let fnid = self.lower_entry(expr);
-        CompiledExpr {
-            vm: self.vm.clone(),
-            fnid,
-        }
-    }
-
-    pub fn param_register(&mut self, param: &LambdaParam) -> Register {
-        let slot = self.param_slot(param);
-        self.vm.borrow().program.params[slot as usize].clone()
-    }
-
-    pub fn storage(&self) -> Rc<RefCell<VarStorage>> {
-        self.storage.clone()
+    /// Lower an expression as a callable zero-parameter function.
+    pub fn compile(&mut self, expr: &QuintEx) -> FnId {
+        self.lower_entry(expr)
     }
 }

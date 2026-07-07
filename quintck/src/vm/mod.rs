@@ -11,9 +11,10 @@
 //!   closure engine's nested `execute` calls — same stack-depth profile,
 //!   no frame machinery. The register file is one shared `Vec<Value>`
 //!   window-allocated per call.
-//! - **Parameters are shared cells** (`Register`), the same representation
-//!   the closure engine uses, so `BoundExpr`/temporal atoms work unchanged.
-//!   Calls save/restore the callee's cells (a few `u32` moves).
+//! - **Parameters and state variables are plain per-Vm banks** indexed by
+//!   slot; calls save/restore the callee's slots (a few `u32` moves). The
+//!   `Program` is immutable after lowering, so a `Vm` per worker thread
+//!   shares it by reference with zero synchronization.
 //! - **Error unwinding**: an error aborts the whole run; `run` restores
 //!   let-cells, parameter cells and `next_mode` from the unwind stacks
 //!   (the caller abandons the run's state, so nothing else needs repair).
@@ -28,8 +29,7 @@ pub use lower::Lowerer;
 
 use crate::error::{unsupported, QuintError};
 use crate::eval::Env;
-use crate::state::Register;
-use crate::value::{EvalResult, U64Buf, Value};
+use crate::value::{value_eq, EvalResult, U64Buf, Value};
 use builtins::VmBuiltin;
 use quint_ast::{QuintId, Symbol};
 use std::rc::Rc;
@@ -115,6 +115,23 @@ pub enum Op {
     Reps,
     /// fail with program error a
     Fail,
+    // Fused superinstructions (one dispatch instead of builtin+branch):
+    /// if !(regs[a] == regs[b]) { pc = c }  (value_eq semantics)
+    GuardEq,
+    /// if !(regs[a] != regs[b]) { pc = c }
+    GuardNeq,
+    /// if !(regs[a] < regs[b]) { pc = c }  (ints)
+    GuardLt,
+    GuardLte,
+    GuardGt,
+    GuardGte,
+    /// regs[a] = regs[b] == regs[c]  (value_eq semantics)
+    Eq,
+    Neq,
+    /// regs[a] = !regs[b]
+    Not,
+    /// regs[a] = record field of regs[b] named field_syms[c]
+    RecField,
 }
 
 pub struct MatchTable {
@@ -128,6 +145,13 @@ pub struct BuiltinCall {
     pub nargs: u16,
 }
 
+/// A statically resolved call site: the callee and its parameter slots,
+/// so the handler binds arguments without touching the function table.
+pub struct CallSite {
+    pub fnid: FnId,
+    pub slots: Box<[u32]>,
+}
+
 pub struct Chunk {
     pub code: Vec<Instr>,
     /// IR node per instruction, for error annotation (same length as code).
@@ -138,19 +162,29 @@ pub struct Chunk {
     pub branch_tables: Vec<Box<[u16]>>,
     pub match_tables: Vec<MatchTable>,
     pub builtin_calls: Vec<BuiltinCall>,
+    pub call_sites: Vec<CallSite>,
+    /// Field names for `RecField` (c operand indexes here).
+    pub field_syms: Vec<Symbol>,
 }
 
+/// The compiled program: immutable after lowering, freely shared across
+/// worker threads by reference. All mutable evaluation state (parameter
+/// and variable banks, caches, stacks) lives in a per-worker [`Vm`].
 pub struct Program {
-    pub funcs: Vec<Rc<Chunk>>,
-    /// Parameter cells by slot (shared with `BoundExpr` bindings).
-    pub params: Vec<Register>,
+    pub funcs: Vec<Chunk>,
     pub param_names: Vec<Symbol>,
-    pub var_current: Vec<Register>,
-    pub var_next: Vec<Register>,
     pub var_names: Vec<Symbol>,
+    pub n_let_cells: usize,
+    pub n_val_cells: usize,
+    pub n_pure_cells: usize,
     /// Static error table for `Fail`.
     pub errors: Vec<(&'static str, String)>,
 }
+
+/// A let cell's content: 16 bytes (the error boxed behind an `Rc`), so
+/// LetEnter/LetExit save/restore are cheap moves — `Option<EvalResult>`
+/// would be ~72 bytes per push/pop.
+type CellVal = Option<Result<Value, Rc<QuintError>>>;
 
 struct AnyRec {
     start: u64,
@@ -160,19 +194,30 @@ struct AnyRec {
     dst: u16,
 }
 
-pub struct Vm {
-    pub program: Program,
+/// Per-worker evaluation state. Borrows the immutable [`Program`];
+/// everything else is owned and thread-private.
+pub struct Vm<'p> {
+    pub program: &'p Program,
     /// Register file, high-water-mark managed: `reg_top` is the logical
     /// stack cursor; slots above it keep stale values (lowering guarantees
     /// every register is written before it is read), so call frames never
     /// memset.
     regs: Vec<Value>,
     reg_top: usize,
-    let_cells: Vec<Option<EvalResult>>,
+    /// Parameter bank (one slot per lambda parameter, save/restored
+    /// around calls).
+    params: Vec<Option<Value>>,
+    /// Current/next state-variable banks (the exploration loop loads
+    /// states here; `assign` writes the next bank).
+    vars_cur: Vec<Option<Value>>,
+    vars_next: Vec<Option<Value>>,
+    /// Bumped whenever the current state changes; keys the `val` caches.
+    generation: u64,
+    let_cells: Vec<CellVal>,
     val_cells: Vec<(u64, Value)>,
     pure_cells: Vec<Option<Value>>,
     // unwind stacks (restored on error abort)
-    cell_stack: Vec<(u32, Option<EvalResult>)>,
+    cell_stack: Vec<(u32, CellVal)>,
     param_stack: Vec<(u32, Option<Value>)>,
     snapshots: Vec<Vec<Option<Value>>>,
     any_stack: Vec<AnyRec>,
@@ -185,6 +230,11 @@ pub struct Vm {
 /// cell values on the stack.
 pub const MAX_PARAMS: usize = 16;
 
+/// CallValue's c operand packs (argbase << 5 | nargs); see the lowerer.
+pub(crate) fn callvalue_unpack(c: u16) -> (usize, usize) {
+    ((c >> 5) as usize, (c & 31) as usize)
+}
+
 struct Marks {
     cells: usize,
     params: usize,
@@ -194,15 +244,19 @@ struct Marks {
     regs: usize,
 }
 
-impl Vm {
-    pub fn new(program: Program) -> Self {
+impl<'p> Vm<'p> {
+    pub fn new(program: &'p Program) -> Self {
         Vm {
             program,
             regs: Vec::new(),
             reg_top: 0,
-            let_cells: Vec::new(),
-            val_cells: Vec::new(),
-            pure_cells: Vec::new(),
+            params: vec![None; program.param_names.len()],
+            vars_cur: vec![None; program.var_names.len()],
+            vars_next: vec![None; program.var_names.len()],
+            generation: 1,
+            let_cells: vec![None; program.n_let_cells],
+            val_cells: vec![(0, Value::bool(false)); program.n_val_cells],
+            pure_cells: vec![None; program.n_pure_cells],
             cell_stack: Vec::new(),
             param_stack: Vec::new(),
             snapshots: Vec::new(),
@@ -212,32 +266,89 @@ impl Vm {
         }
     }
 
-    /// Push a pooled snapshot of the next-state registers.
-    fn push_snapshot(&mut self, env: &Env) {
+    // -----------------------------------------------------------------
+    // State-variable bank management (the exploration loop's interface)
+    // -----------------------------------------------------------------
+
+    /// Make `state` the current state.
+    pub fn load(&mut self, state: &[Value]) {
+        debug_assert_eq!(state.len(), self.vars_cur.len());
+        for (slot, v) in self.vars_cur.iter_mut().zip(state) {
+            *slot = Some(*v);
+        }
+        self.generation += 1;
+    }
+
+    /// Unset the current state (initial-state enumeration: reading an
+    /// unassigned variable is then a QNT502 error).
+    pub fn clear_current(&mut self) {
+        self.vars_cur.fill(None);
+        self.generation += 1;
+    }
+
+    pub fn reset_next(&mut self) {
+        self.vars_next.fill(None);
+    }
+
+    /// Commit the next state: assigned next-vars move into current,
+    /// unassigned keep their current value (run-test `then`/`reps`).
+    pub fn commit_shift(&mut self) {
+        for (cur, next) in self.vars_cur.iter_mut().zip(self.vars_next.iter_mut()) {
+            if let Some(v) = next.take() {
+                *cur = Some(v);
+            }
+        }
+        self.generation += 1;
+    }
+
+    /// Load `state` into the next bank (temporal edge-atom evaluation).
+    pub fn load_next(&mut self, state: &[Value]) {
+        debug_assert_eq!(state.len(), self.vars_next.len());
+        for (slot, v) in self.vars_next.iter_mut().zip(state) {
+            *slot = Some(*v);
+        }
+    }
+
+    /// Raw next-bank contents after an action run (None = unconstrained).
+    pub fn take_partial(&self) -> Vec<Option<Value>> {
+        self.vars_next.clone()
+    }
+
+    /// The successor state after a successful action run; every variable
+    /// must have been assigned.
+    pub fn take_next_state(&self) -> Result<crate::state::State, QuintError> {
+        let values = self
+            .vars_next
+            .iter()
+            .zip(self.program.var_names.iter())
+            .map(|(slot, name)| {
+                slot.ok_or_else(|| {
+                    QuintError::new(
+                        "QNT502",
+                        format!("action succeeded but did not assign variable {name}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(std::rc::Rc::from(values.into_boxed_slice()))
+    }
+
+    /// Bind a parameter slot, returning the previous value (BoundExpr).
+    pub fn param_replace(&mut self, slot: u32, v: Option<Value>) -> Option<Value> {
+        std::mem::replace(&mut self.params[slot as usize], v)
+    }
+
+    /// Push a pooled snapshot of the next-state bank.
+    fn push_snapshot(&mut self) {
         let mut buf = self.snap_pool.pop().unwrap_or_default();
-        env.storage.borrow().snapshot_next_into(&mut buf);
+        buf.clear();
+        buf.extend(self.vars_next.iter().copied());
         self.snapshots.push(buf);
     }
 
     fn pop_snapshot(&mut self) {
         let buf = self.snapshots.pop().expect("unbalanced snapshot pop");
         self.snap_pool.push(buf);
-    }
-
-    pub(crate) fn add_let_cell(&mut self) -> u32 {
-        self.let_cells.push(None);
-        self.let_cells.len() as u32 - 1
-    }
-
-    pub(crate) fn add_val_cell(&mut self) -> u32 {
-        // generation 0 never matches (VarStorage starts at 1)
-        self.val_cells.push((0, Value::bool(false)));
-        self.val_cells.len() as u32 - 1
-    }
-
-    pub(crate) fn add_pure_cell(&mut self) -> u32 {
-        self.pure_cells.push(None);
-        self.pure_cells.len() as u32 - 1
     }
 
     /// Top-level entry: execute function `entry` and clean up the unwind
@@ -271,7 +382,7 @@ impl Vm {
         }
         while self.param_stack.len() > m.params {
             let (slot, old) = self.param_stack.pop().unwrap();
-            self.program.params[slot as usize].set(old);
+            self.params[slot as usize] = old;
         }
         while self.snapshots.len() > m.snaps {
             self.pop_snapshot();
@@ -287,15 +398,17 @@ impl Vm {
     /// The window is not cleared: the file only grows to the high-water
     /// mark, and stale values are fine because lowering writes every
     /// register before reading it.
+    ///
     fn exec(&mut self, env: &mut Env, fnid: FnId) -> EvalResult {
-        let chunk = self.program.funcs[fnid as usize].clone();
+        // 'p outlives &mut self: no Rc, no clone
+        let chunk: &'p Chunk = &self.program.funcs[fnid as usize];
         let base = self.reg_top;
         let top = base + chunk.nregs as usize;
         if self.regs.len() < top {
             self.regs.resize(top, Value::bool(false));
         }
         self.reg_top = top;
-        let result = self.exec_in(env, &chunk, base);
+        let result = self.exec_in(env, chunk, base);
         self.reg_top = base;
         result
     }
@@ -304,18 +417,147 @@ impl Vm {
     pub fn call_lambda(&mut self, env: &mut Env, lam: Value, args: &[Value]) -> EvalResult {
         let lamv = lam.as_lambda();
         let fnid = lamv.fnid;
-        debug_assert_eq!(lamv.registers.len(), args.len());
+        debug_assert_eq!(lamv.slots.len(), args.len());
         debug_assert!(args.len() <= MAX_PARAMS);
         let mut saved = [None; MAX_PARAMS];
-        for (i, (cell, arg)) in lamv.registers.iter().zip(args).enumerate() {
-            saved[i] = cell.replace(Some(*arg));
+        for (i, (&slot, arg)) in lamv.slots.iter().zip(args).enumerate() {
+            saved[i] = self.params[slot as usize].replace(*arg);
         }
         let result = self.exec(env, fnid);
-        for (i, cell) in lamv.registers.iter().enumerate() {
-            cell.set(saved[i]);
+        for (i, &slot) in lamv.slots.iter().enumerate() {
+            self.params[slot as usize] = saved[i];
         }
         result
     }
+
+    // -----------------------------------------------------------------
+    // Shared operation bodies (interpreter handlers and JIT helpers)
+    // -----------------------------------------------------------------
+
+    /// Dynamic call of a lambda value with arguments at `regs[ab..]`.
+    pub(crate) fn call_value_abs(&mut self, env: &mut Env, lam: Value, ab: usize) -> EvalResult {
+        let lamv = lam.as_lambda();
+        let n = lamv.slots.len();
+        debug_assert!(n <= MAX_PARAMS);
+        let fnid = lamv.fnid;
+        let mut saved = [None; MAX_PARAMS];
+        for (i, &slot) in lamv.slots.iter().enumerate() {
+            saved[i] = self.params[slot as usize].replace(self.regs[ab + i]);
+        }
+        let result = self.exec(env, fnid);
+        for (i, &slot) in lamv.slots.iter().enumerate() {
+            self.params[slot as usize] = saved[i];
+        }
+        result
+    }
+
+    /// Let-scoped call-by-need (caches `Err` too, like the interpreter).
+    pub(crate) fn call_cached_let(&mut self, env: &mut Env, fnid: FnId, cell: usize) -> EvalResult {
+        match &self.let_cells[cell] {
+            Some(Ok(v)) => Ok(*v),
+            Some(Err(e)) => Err((**e).clone()),
+            None => {
+                let result = self.exec(env, fnid);
+                self.let_cells[cell] = Some(match &result {
+                    Ok(v) => Ok(*v),
+                    Err(e) => Err(Rc::new(e.clone())),
+                });
+                result
+            }
+        }
+    }
+
+    /// Per-state `val` cache: keyed on the storage generation, bypassed
+    /// entirely under next_mode; only `Ok` is cached.
+    pub(crate) fn call_cached_val(&mut self, env: &mut Env, fnid: FnId, cell: usize) -> EvalResult {
+        if env.next_mode {
+            return self.exec(env, fnid);
+        }
+        let gen = self.generation;
+        if self.val_cells[cell].0 == gen {
+            return Ok(self.val_cells[cell].1);
+        }
+        let v = self.exec(env, fnid)?;
+        self.val_cells[cell] = (gen, v);
+        Ok(v)
+    }
+
+    pub(crate) fn call_cached_pure(&mut self, env: &mut Env, fnid: FnId, cell: usize) -> EvalResult {
+        if let Some(v) = self.pure_cells[cell] {
+            return Ok(v);
+        }
+        let v = self.exec(env, fnid)?;
+        self.pure_cells[cell] = Some(v);
+        Ok(v)
+    }
+
+    pub(crate) fn let_enter(&mut self, cell: usize) {
+        let old = self.let_cells[cell].take();
+        self.cell_stack.push((cell as u32, old));
+    }
+
+    pub(crate) fn let_exit(&mut self, cell: usize) {
+        let (c, old) = self.cell_stack.pop().expect("unbalanced LetExit");
+        debug_assert_eq!(c as usize, cell);
+        self.let_cells[c as usize] = old;
+    }
+
+    pub(crate) fn param_enter(&mut self, slot: usize, v: Value) {
+        let old = self.params[slot].replace(v);
+        self.param_stack.push((slot as u32, old));
+    }
+
+    pub(crate) fn param_exit(&mut self, slot: usize) {
+        let (s, old) = self.param_stack.pop().expect("unbalanced ParamExit");
+        debug_assert_eq!(s as usize, slot);
+        self.params[s as usize] = old;
+    }
+
+    /// Nondet binding: choose an element of `set` into the let cell
+    /// (pushing the old cell value). Returns Ok(false) when the set is
+    /// empty (branch disabled; cell untouched).
+    pub(crate) fn one_of_bind(
+        &mut self,
+        env: &mut Env,
+        cell: usize,
+        set: Value,
+    ) -> Result<bool, QuintError> {
+        let bounds = set.bounds()?;
+        let mut indices = U64Buf::new();
+        for &bound in bounds.iter() {
+            match env.choose(bound)? {
+                Some(i) => indices.push(i),
+                None => return Ok(false),
+            }
+        }
+        let picked = set.pick(&mut indices.iter().copied())?.normalize()?;
+        let old = self.let_cells[cell].replace(Ok(picked));
+        self.cell_stack.push((cell as u32, old));
+        Ok(true)
+    }
+
+    /// Restore the next bank from the top snapshot without popping it
+    /// (actionAny retry).
+    fn restore_last_snapshot(&mut self) {
+        let snap = self.snapshots.last().expect("no snapshot");
+        self.vars_next.copy_from_slice(snap);
+    }
+
+    fn restore_pop(&mut self) {
+        let snap = self.snapshots.pop().expect("unbalanced snapshot pop");
+        self.vars_next.copy_from_slice(&snap);
+        self.snap_pool.push(snap);
+    }
+
+    pub(crate) fn next_enter(&mut self, env: &mut Env) {
+        self.next_stack.push(env.next_mode);
+        env.next_mode = true;
+    }
+
+    pub(crate) fn next_exit(&mut self, env: &mut Env) {
+        env.next_mode = self.next_stack.pop().expect("unbalanced NextExit");
+    }
+
 
     fn exec_in(&mut self, env: &mut Env, chunk: &Chunk, base: usize) -> EvalResult {
         macro_rules! reg {
@@ -357,11 +599,11 @@ impl Vm {
                 Op::Move => reg!(ins.a) = reg!(ins.b),
                 Op::LoadVar => {
                     let bank = if env.next_mode {
-                        &self.program.var_next
+                        &self.vars_next
                     } else {
-                        &self.program.var_current
+                        &self.vars_cur
                     };
-                    match bank[ins.b as usize].get() {
+                    match bank[ins.b as usize] {
                         Some(v) => reg!(ins.a) = v,
                         None => fail!(
                             pc,
@@ -377,10 +619,10 @@ impl Vm {
                 }
                 Op::Assign => {
                     let value = try_at!(pc, reg!(ins.c).normalize());
-                    self.program.var_next[ins.b as usize].set(Some(value));
+                    self.vars_next[ins.b as usize] = Some(value);
                     reg!(ins.a) = Value::bool(true);
                 }
-                Op::LoadParam => match self.program.params[ins.b as usize].get() {
+                Op::LoadParam => match self.params[ins.b as usize] {
                     Some(v) => reg!(ins.a) = v,
                     None => fail!(
                         pc,
@@ -402,35 +644,23 @@ impl Vm {
                     }
                 }
                 Op::Call => {
-                    let callee = self.program.funcs[ins.b as usize].clone();
+                    let site = &chunk.call_sites[ins.b as usize];
                     let ab = base + ins.c as usize;
-                    debug_assert!(callee.param_slots.len() <= MAX_PARAMS);
+                    debug_assert!(site.slots.len() <= MAX_PARAMS);
                     let mut saved = [None; MAX_PARAMS];
-                    for (i, &slot) in callee.param_slots.iter().enumerate() {
-                        saved[i] = self.program.params[slot as usize]
-                            .replace(Some(self.regs[ab + i]));
+                    for (i, &slot) in site.slots.iter().enumerate() {
+                        saved[i] = self.params[slot as usize].replace(self.regs[ab + i]);
                     }
-                    let result = self.exec(env, ins.b as u32);
-                    for (i, &slot) in callee.param_slots.iter().enumerate() {
-                        self.program.params[slot as usize].set(saved[i]);
+                    let result = self.exec(env, site.fnid);
+                    for (i, &slot) in site.slots.iter().enumerate() {
+                        self.params[slot as usize] = saved[i];
                     }
                     reg!(ins.a) = try_at!(pc, result);
                 }
                 Op::CallValue => {
                     let lam = reg!(ins.b);
-                    let ab = base + ins.c as usize;
-                    let lamv = lam.as_lambda();
-                    let n = lamv.registers.len();
-                    debug_assert!(n <= MAX_PARAMS);
-                    let fnid = lamv.fnid;
-                    let mut saved = [None; MAX_PARAMS];
-                    for (i, cell) in lamv.registers.iter().enumerate() {
-                        saved[i] = cell.replace(Some(self.regs[ab + i]));
-                    }
-                    let result = self.exec(env, fnid);
-                    for (i, cell) in lamv.registers.iter().enumerate() {
-                        cell.set(saved[i]);
-                    }
+                    let (rel, _nargs) = callvalue_unpack(ins.c);
+                    let result = self.call_value_abs(env, lam, base + rel);
                     reg!(ins.a) = try_at!(pc, result);
                 }
                 Op::Ret => return Ok(reg!(ins.a)),
@@ -450,81 +680,25 @@ impl Vm {
                     reg!(ins.a) = try_at!(pc, result);
                 }
                 Op::CallCached => {
-                    let cell = ins.c as usize;
-                    match &self.let_cells[cell] {
-                        Some(r) => reg!(ins.a) = try_at!(pc, r.clone()),
-                        None => {
-                            let result = self.exec(env, ins.b as u32);
-                            self.let_cells[cell] = Some(result.clone());
-                            reg!(ins.a) = try_at!(pc, result);
-                        }
-                    }
+                    let result = self.call_cached_let(env, ins.b as u32, ins.c as usize);
+                    reg!(ins.a) = try_at!(pc, result);
                 }
                 Op::CallCachedVal => {
-                    // The per-state cache keys on the *current* state; under
-                    // next_mode the val reads the next bank, so bypass the
-                    // cache entirely (read and write).
-                    if env.next_mode {
-                        let result = self.exec(env, ins.b as u32);
-                        reg!(ins.a) = try_at!(pc, result);
-                    } else {
-                        let gen = env.storage.borrow().generation.get();
-                        let cell = ins.c as usize;
-                        if self.val_cells[cell].0 == gen {
-                            reg!(ins.a) = self.val_cells[cell].1;
-                        } else {
-                            let v = try_at!(pc, self.exec(env, ins.b as u32));
-                            self.val_cells[cell] = (gen, v);
-                            reg!(ins.a) = v;
-                        }
-                    }
+                    let result = self.call_cached_val(env, ins.b as u32, ins.c as usize);
+                    reg!(ins.a) = try_at!(pc, result);
                 }
                 Op::CallCachedPure => {
-                    let cell = ins.c as usize;
-                    match self.pure_cells[cell] {
-                        Some(v) => reg!(ins.a) = v,
-                        None => {
-                            let v = try_at!(pc, self.exec(env, ins.b as u32));
-                            self.pure_cells[cell] = Some(v);
-                            reg!(ins.a) = v;
-                        }
-                    }
+                    let result = self.call_cached_pure(env, ins.b as u32, ins.c as usize);
+                    reg!(ins.a) = try_at!(pc, result);
                 }
-                Op::LetEnter => {
-                    let cell = ins.a as usize;
-                    let old = self.let_cells[cell].take();
-                    self.cell_stack.push((ins.a as u32, old));
-                }
-                Op::LetExit => {
-                    let (cell, old) = self.cell_stack.pop().expect("unbalanced LetExit");
-                    debug_assert_eq!(cell, ins.a as u32);
-                    self.let_cells[cell as usize] = old;
-                }
+                Op::LetEnter => self.let_enter(ins.a as usize),
+                Op::LetExit => self.let_exit(ins.a as usize),
                 Op::OneOfBind => {
                     let set = reg!(ins.b);
-                    let bounds = try_at!(pc, set.bounds());
-                    let mut indices = U64Buf::new();
-                    let mut empty = false;
-                    for &bound in bounds.iter() {
-                        match try_at!(pc, env.choose(bound)) {
-                            Some(i) => indices.push(i),
-                            None => {
-                                // empty set: this branch is disabled
-                                empty = true;
-                                break;
-                            }
-                        }
-                    }
-                    if empty {
+                    let bound = try_at!(pc, self.one_of_bind(env, ins.a as usize, set));
+                    if !bound {
+                        // empty set: this branch is disabled
                         pc = ins.c as usize;
-                    } else {
-                        let picked = try_at!(
-                            pc,
-                            set.pick(&mut indices.iter().copied()).and_then(|v| v.normalize())
-                        );
-                        let cell = ins.a as usize;
-                        let old = self.let_cells[cell].replace(Ok(picked));
-                        self.cell_stack.push((ins.a as u32, old));
                     }
                 }
                 Op::OneOfPick => {
@@ -551,7 +725,7 @@ impl Vm {
                             pc = ins.c as usize;
                         }
                         Some(start) => {
-                            self.push_snapshot(env);
+                            self.push_snapshot();
                             self.any_stack.push(AnyRec {
                                 start,
                                 tried: 0,
@@ -579,9 +753,7 @@ impl Vm {
                     } else {
                         let tried = tried + 1;
                         let tries = if env.any_fallthrough { n } else { 1 };
-                        env.storage
-                            .borrow()
-                            .restore_next(self.snapshots.last().unwrap());
+                        self.restore_last_snapshot();
                         if tried < tries {
                             self.any_stack[idx].tried = tried;
                             let branch = (start as usize + tried) % n;
@@ -594,28 +766,19 @@ impl Vm {
                         }
                     }
                 }
-                Op::Shift => {
-                    env.storage.borrow().shift();
-                }
+                Op::Shift => self.commit_shift(),
                 Op::NextEnter => {
                     if !env.next_allowed {
                         fail!(pc, unsupported("next() outside a temporal property"));
                     }
-                    self.next_stack.push(env.next_mode);
-                    env.next_mode = true;
+                    self.next_enter(env);
                 }
-                Op::NextExit => {
-                    env.next_mode = self.next_stack.pop().expect("unbalanced NextExit");
-                }
+                Op::NextExit => self.next_exit(env),
                 Op::ParamEnter => {
-                    let old = self.program.params[ins.a as usize].replace(Some(reg!(ins.b)));
-                    self.param_stack.push((ins.a as u32, old));
+                    let v = reg!(ins.b);
+                    self.param_enter(ins.a as usize, v);
                 }
-                Op::ParamExit => {
-                    let (slot, old) = self.param_stack.pop().expect("unbalanced ParamExit");
-                    debug_assert_eq!(slot, ins.a as u32);
-                    self.program.params[slot as usize].set(old);
-                }
+                Op::ParamExit => self.param_exit(ins.a as usize),
                 Op::MatchVariant => {
                     let (label, payload) = reg!(ins.b).as_variant();
                     let table = &chunk.match_tables[ins.c as usize];
@@ -638,13 +801,9 @@ impl Vm {
                     }
                 }
                 Op::SnapNext => {
-                    self.push_snapshot(env);
+                    self.push_snapshot();
                 }
-                Op::RestoreSnapPop => {
-                    let snap = self.snapshots.pop().expect("unbalanced RestoreSnapPop");
-                    env.storage.borrow().restore_next(&snap);
-                    self.snap_pool.push(snap);
-                }
+                Op::RestoreSnapPop => self.restore_pop(),
                 Op::DropSnap => {
                     self.pop_snapshot();
                 }
@@ -668,7 +827,7 @@ impl Vm {
                             );
                         }
                         if i < reps - 1 {
-                            env.storage.borrow().shift();
+                            self.commit_shift();
                         }
                     }
                     reg!(ins.a) = result;
@@ -676,6 +835,52 @@ impl Vm {
                 Op::Fail => {
                     let (code, msg) = &self.program.errors[ins.a as usize];
                     fail!(pc, QuintError::new(code, msg.clone()));
+                }
+                Op::GuardEq | Op::GuardNeq => {
+                    let (x, y) = (reg!(ins.a), reg!(ins.b));
+                    let eq = if x == y {
+                        true
+                    } else if !x.is_symbolic() && !y.is_symbolic() {
+                        false
+                    } else {
+                        try_at!(pc, value_eq(x, y))
+                    };
+                    if eq != (ins.op == Op::GuardEq) {
+                        pc = ins.c as usize;
+                    }
+                }
+                Op::GuardLt | Op::GuardLte | Op::GuardGt | Op::GuardGte => {
+                    let (x, y) = (reg!(ins.a).as_int(), reg!(ins.b).as_int());
+                    let pass = match ins.op {
+                        Op::GuardLt => x < y,
+                        Op::GuardLte => x <= y,
+                        Op::GuardGt => x > y,
+                        _ => x >= y,
+                    };
+                    if !pass {
+                        pc = ins.c as usize;
+                    }
+                }
+                Op::Eq | Op::Neq => {
+                    let (x, y) = (reg!(ins.b), reg!(ins.c));
+                    let eq = if x == y {
+                        true
+                    } else if !x.is_symbolic() && !y.is_symbolic() {
+                        false
+                    } else {
+                        try_at!(pc, value_eq(x, y))
+                    };
+                    reg!(ins.a) = Value::bool(eq == (ins.op == Op::Eq));
+                }
+                Op::Not => {
+                    let v = !reg!(ins.b).as_bool();
+                    reg!(ins.a) = Value::bool(v);
+                }
+                Op::RecField => {
+                    let sym = chunk.field_syms[ins.c as usize];
+                    reg!(ins.a) = reg!(ins.b)
+                        .record_field(sym)
+                        .expect("field: no such field (type checker bug?)");
                 }
             }
         }

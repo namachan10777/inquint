@@ -3,10 +3,10 @@
 
 use crate::choice::ChoiceCtl;
 use crate::error::QuintError;
-use crate::eval::{CompiledExpr, Env};
-use crate::state::{State, VarStorage};
+use crate::eval::{BoundExpr, Env};
+use crate::state::State;
 use crate::value::Value;
-use std::cell::RefCell;
+use crate::vm::{FnId, Vm};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -56,24 +56,24 @@ impl SubActionRuns {
 /// Enumerate all runs of a *sub-action* (e.g. a fairness target or an
 /// orKeep/mustChange action) from `from`, as partial assignments.
 pub fn enumerate_partial(
-    action: &crate::eval::BoundExpr,
-    storage: &Rc<RefCell<VarStorage>>,
+    vm: &mut Vm,
+    action: &BoundExpr,
     from: &[Value],
 ) -> Result<SubActionRuns, QuintError> {
-    let saved = action.set_bindings();
-    let result = enumerate_partial_inner(action, storage, from);
-    action.restore_bindings(saved);
+    let saved = action.set_bindings(vm);
+    let result = enumerate_partial_inner(vm, action.fnid, from);
+    action.restore_bindings(vm, saved);
     result
 }
 
 fn enumerate_partial_inner(
-    action: &crate::eval::BoundExpr,
-    storage: &Rc<RefCell<VarStorage>>,
+    vm: &mut Vm,
+    action: FnId,
     from: &[Value],
 ) -> Result<SubActionRuns, QuintError> {
-    storage.borrow().load(from);
+    vm.load(from);
 
-    let ctl = Rc::new(RefCell::new(ChoiceCtl::new()));
+    let mut ctl = ChoiceCtl::new();
     let mut partials = BTreeSet::new();
     let mut runs: u64 = 0;
 
@@ -85,13 +85,13 @@ fn enumerate_partial_inner(
                 format!("more than {MAX_RUNS_PER_STATE} choice combinations in one sub-action"),
             ));
         }
-        storage.borrow().reset_next();
-        let mut env = Env::new(storage.clone(), Some(ctl.clone()));
-        let enabled = action.expr.execute(&mut env)?;
+        vm.reset_next();
+        let mut env = Env::new(Some(&mut ctl));
+        let enabled = vm.run(&mut env, action)?;
         if enabled.as_bool() {
-            partials.insert(storage.borrow().take_partial());
+            partials.insert(vm.take_partial());
         }
-        if !ctl.borrow_mut().advance() {
+        if !ctl.advance() {
             break;
         }
     }
@@ -103,16 +103,16 @@ fn enumerate_partial_inner(
 /// (or all initial states when `from` is `None`). The result is sorted
 /// (by id) and deduplicated.
 pub fn enumerate(
-    action: &CompiledExpr,
-    storage: &Rc<RefCell<VarStorage>>,
+    vm: &mut Vm,
+    action: FnId,
     from: Option<&[Value]>,
 ) -> Result<Vec<State>, QuintError> {
     match from {
-        Some(state) => storage.borrow().load(state),
-        None => storage.borrow().clear_current(),
+        Some(state) => vm.load(state),
+        None => vm.clear_current(),
     }
 
-    let ctl = Rc::new(RefCell::new(ChoiceCtl::new()));
+    let mut ctl = ChoiceCtl::new();
     let mut out: Vec<State> = Vec::new();
     let mut runs: u64 = 0;
 
@@ -128,13 +128,13 @@ pub fn enumerate(
             ));
         }
 
-        storage.borrow().reset_next();
-        let mut env = Env::new(storage.clone(), Some(ctl.clone()));
-        let enabled = action.execute(&mut env)?;
+        vm.reset_next();
+        let mut env = Env::new(Some(&mut ctl));
+        let enabled = vm.run(&mut env, action)?;
         if enabled.as_bool() {
-            out.push(storage.borrow().take_next_state()?);
+            out.push(vm.take_next_state()?);
         }
-        if !ctl.borrow_mut().advance() {
+        if !ctl.advance() {
             break;
         }
     }

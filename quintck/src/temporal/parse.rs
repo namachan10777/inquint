@@ -8,8 +8,7 @@
 
 use super::ltl::{EdgeAtomId, Ltl, StateAtomId};
 use crate::error::QuintError;
-use crate::eval::{BoundExpr, Env};
-use crate::state::Register;
+use crate::eval::BoundExpr;
 use crate::vm::Lowerer;
 use crate::value::Value;
 use quint_ast::{Declaration, LookupDefinition, LookupTable, QuintEx, QuintId, QuintName};
@@ -19,7 +18,7 @@ use std::collections::BTreeMap;
 pub type ActionId = u32;
 pub type VarsId = u32;
 
-type Binding = (QuintId, Register, Value);
+type Binding = (QuintId, u32, Value);
 
 pub enum StateAtom {
     /// A plain state predicate.
@@ -88,7 +87,7 @@ pub struct Parser<'c, 't> {
     compiler: &'c mut Lowerer<'t>,
     table: &'t LookupTable,
     pub atoms: AtomTable,
-    /// Current quantifier bindings: (param id, register, value).
+    /// Current quantifier bindings: (param id, parameter slot, value).
     bindings: Vec<Binding>,
     temporal_memo: FxHashMap<QuintId, TemporalKind>,
 }
@@ -494,14 +493,10 @@ impl<'c, 't> Parser<'c, 't> {
     }
 
     fn bound_expr(&mut self, expr: &QuintEx) -> BoundExpr {
-        let compiled = self.compiler.compile(expr);
+        let fnid = self.compiler.compile(expr);
         BoundExpr {
-            expr: compiled,
-            bindings: self
-                .bindings
-                .iter()
-                .map(|(_, reg, v)| (reg.clone(), *v))
-                .collect(),
+            fnid,
+            bindings: self.bindings.iter().map(|&(_, slot, v)| (slot, v)).collect(),
         }
     }
 
@@ -567,25 +562,16 @@ impl<'c, 't> Parser<'c, 't> {
     }
 
     fn push_binding_param(&mut self, param: &quint_ast::LambdaParam, value: Value) {
-        let register = self.compiler.param_register(param);
-        self.bindings.push((param.id, register, value));
+        let slot = self.compiler.param_slot(param);
+        self.bindings.push((param.id, slot, value));
     }
 
     /// Evaluate a state-independent expression (e.g. a quantifier domain).
     fn eval_pure(&mut self, expr: &QuintEx) -> Result<Value, QuintError> {
-        let compiled = self.compiler.compile(expr);
-        let be = BoundExpr {
-            expr: compiled,
-            bindings: self
-                .bindings
-                .iter()
-                .map(|(_, reg, v)| (reg.clone(), *v))
-                .collect(),
-        };
-        let storage = self.compiler.storage();
-        storage.borrow().clear_current();
-        let mut env = Env::new(storage, None);
-        be.eval(&mut env).map_err(|e| {
+        let fnid = self.compiler.compile(expr);
+        let bindings: Vec<(u32, Value)> =
+            self.bindings.iter().map(|&(_, slot, v)| (slot, v)).collect();
+        self.compiler.eval_bound(fnid, &bindings).map_err(|e| {
             if e.code == "QNT502" {
                 err("temporal quantification over a state-dependent set is not supported")
             } else {

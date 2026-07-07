@@ -54,6 +54,13 @@ struct Cli {
     #[arg(long)]
     exact_states: bool,
 
+    /// Worker threads for invariant/deadlock checking (default: all
+    /// cores). Temporal checking, run tests and --exact-states are
+    /// single-threaded regardless. With --max-states, the parallel run
+    /// may overshoot the cap by a few work chunks.
+    #[arg(long)]
+    threads: Option<usize>,
+
     /// Write the counterexample trace in ITF format to this file
     #[arg(long)]
     out_itf: Option<PathBuf>,
@@ -147,6 +154,7 @@ fn main() -> ExitCode {
         deadlock: !cli.no_deadlock,
         max_states: cli.max_states,
         exact_states: cli.exact_states,
+        threads: cli.threads.unwrap_or_else(|| CheckConfig::default().threads),
     };
 
     let source = cli.input.display().to_string();

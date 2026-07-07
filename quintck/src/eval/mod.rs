@@ -1,5 +1,4 @@
-//! The evaluation runtime shared surface: the environment, compiled
-//! expressions (bytecode functions of the [`crate::vm`] engine), and
+//! The evaluation runtime shared surface: the per-run environment and
 //! quantifier-bound expressions used by the temporal layer.
 //!
 //! Nondeterminism (`any`, `nondet`/`oneOf`) goes through the
@@ -10,19 +9,17 @@ pub mod builtins_eager;
 
 use crate::choice::ChoiceCtl;
 use crate::error::QuintError;
-use crate::state::{Register, VarStorage};
 use crate::value::{EvalResult, Value};
-use std::cell::RefCell;
-use std::fmt;
-use std::rc::Rc;
+use crate::vm::{FnId, Vm};
 
-pub struct Env {
-    pub storage: Rc<RefCell<VarStorage>>,
+/// Per-run evaluation environment. Carries only run-scoped flags and a
+/// mutable borrow of the choice oracle — no shared ownership.
+pub struct Env<'c> {
     /// The choice oracle. `None` during invariant evaluation, where any
     /// nondeterminism is an error.
-    pub choices: Option<Rc<RefCell<ChoiceCtl>>>,
-    /// When true, state-variable reads take the `next` register bank —
-    /// this is how `next(x)` is evaluated inside temporal edge atoms.
+    pub choices: Option<&'c mut ChoiceCtl>,
+    /// When true, state-variable reads take the `next` bank — this is how
+    /// `next(x)` is evaluated inside temporal edge atoms.
     pub next_mode: bool,
     /// `next(...)` is only legal while evaluating a temporal edge atom.
     pub next_allowed: bool,
@@ -34,13 +31,9 @@ pub struct Env {
     pub any_fallthrough: bool,
 }
 
-impl Env {
-    pub fn new(
-        storage: Rc<RefCell<VarStorage>>,
-        choices: Option<Rc<RefCell<ChoiceCtl>>>,
-    ) -> Self {
+impl<'c> Env<'c> {
+    pub fn new(choices: Option<&'c mut ChoiceCtl>) -> Self {
         Env {
-            storage,
             choices,
             next_mode: false,
             next_allowed: false,
@@ -52,8 +45,8 @@ impl Env {
     /// is not allowed in this context. `Ok(None)` means the choice is empty
     /// (branch disabled).
     pub fn choose(&mut self, bound: u64) -> Result<Option<u64>, QuintError> {
-        match &self.choices {
-            Some(ctl) => Ok(ctl.borrow_mut().choose(bound)),
+        match &mut self.choices {
+            Some(ctl) => Ok(ctl.choose(bound)),
             None => Err(QuintError::new(
                 "QNT501",
                 "nondeterministic choice (oneOf/any) is not allowed in this context \
@@ -63,55 +56,35 @@ impl Env {
     }
 }
 
-/// A compiled expression: a bytecode function of a shared [`crate::vm::Vm`].
-/// `execute` is a top-level entry only — VM execution never re-enters
-/// through `CompiledExpr` (internal calls go through `FnId` directly).
-#[derive(Clone)]
-pub struct CompiledExpr {
-    pub vm: Rc<RefCell<crate::vm::Vm>>,
-    pub fnid: crate::vm::FnId,
-}
-
-impl CompiledExpr {
-    pub fn execute(&self, env: &mut Env) -> EvalResult {
-        self.vm.borrow_mut().run(env, self.fnid)
-    }
-}
-
-impl fmt::Debug for CompiledExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<fn {}>", self.fnid)
-    }
-}
-
 /// A compiled expression plus captured values for quantifier-bound
 /// parameters (used by temporal atoms instantiated under `Set.forall`).
-/// Evaluation sets the shared param registers around the call.
+/// Evaluation binds the parameter slots around the call.
 #[derive(Clone)]
 pub struct BoundExpr {
-    pub expr: CompiledExpr,
-    pub bindings: Vec<(Register, Value)>,
+    pub fnid: FnId,
+    /// (parameter slot, captured value)
+    pub bindings: Vec<(u32, Value)>,
 }
 
 impl BoundExpr {
-    pub fn eval(&self, env: &mut Env) -> EvalResult {
-        let saved = self.set_bindings();
-        let result = self.expr.execute(env);
-        self.restore_bindings(saved);
+    pub fn eval(&self, vm: &mut Vm, env: &mut Env) -> EvalResult {
+        let saved = self.set_bindings(vm);
+        let result = vm.run(env, self.fnid);
+        self.restore_bindings(vm, saved);
         result
     }
 
-    /// Install the captured bindings; returns the previous register values.
-    pub fn set_bindings(&self) -> Vec<Option<Value>> {
+    /// Install the captured bindings; returns the previous slot values.
+    pub fn set_bindings(&self, vm: &mut Vm) -> Vec<Option<Value>> {
         self.bindings
             .iter()
-            .map(|(reg, value)| reg.replace(Some(*value)))
+            .map(|&(slot, value)| vm.param_replace(slot, Some(value)))
             .collect()
     }
 
-    pub fn restore_bindings(&self, saved: Vec<Option<Value>>) {
-        for ((reg, _), old) in self.bindings.iter().zip(saved) {
-            reg.set(old);
+    pub fn restore_bindings(&self, vm: &mut Vm, saved: Vec<Option<Value>>) {
+        for (&(slot, _), old) in self.bindings.iter().zip(saved) {
+            vm.param_replace(slot, old);
         }
     }
 }

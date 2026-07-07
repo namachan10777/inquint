@@ -31,6 +31,9 @@ pub struct CheckConfig {
     pub max_states: Option<u64>,
     /// Keep full states for exact deduplication instead of fingerprints.
     pub exact_states: bool,
+    /// Worker threads for the fingerprint BFS (exact mode, temporal
+    /// checking and run tests are single-threaded regardless).
+    pub threads: usize,
 }
 
 impl Default for CheckConfig {
@@ -40,6 +43,7 @@ impl Default for CheckConfig {
             deadlock: true,
             max_states: None,
             exact_states: false,
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
     }
 }
@@ -71,16 +75,32 @@ pub struct CheckError {
 pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<CheckError>> {
     if cfg.exact_states {
         check_exact(spec, cfg)
+    } else if cfg.threads > 1 {
+        match check_parallel(spec, cfg) {
+            // Anything that needs a trace or an error report is redone
+            // single-threaded: the sequential pass is deterministic, finds
+            // the same (minimal) violation depth, and reuses the existing
+            // trace-reconstruction machinery.
+            ParOutcome::Rerun => check_fp(spec, cfg),
+            ParOutcome::Pass { states, max_depth } => {
+                Ok(CheckOutcome::Pass { states, max_depth })
+            }
+            ParOutcome::Incomplete { states } => Ok(CheckOutcome::Incomplete { states }),
+        }
     } else {
         check_fp(spec, cfg)
     }
 }
 
 // Check the invariants on a state; return the first violated one.
-fn check_invs(spec: &CompiledSpec, state: &[Value]) -> Result<Option<QuintName>, QuintError> {
-    for (name, inv) in &spec.invariants {
-        if !spec.eval_invariant_at(state, inv)?.as_bool() {
-            return Ok(Some(*name));
+fn check_invs(
+    spec: &CompiledSpec,
+    vm: &mut crate::vm::Vm,
+    state: &[Value],
+) -> Result<Option<QuintName>, QuintError> {
+    for &(name, inv) in &spec.invariants {
+        if !spec.eval_invariant_at(vm, state, inv)?.as_bool() {
+            return Ok(Some(name));
         }
     }
     Ok(None)
@@ -134,7 +154,200 @@ impl FlatFrontier {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parallel fingerprint mode
+// ---------------------------------------------------------------------------
+
+/// Fingerprint seen-set sharded by the fingerprint's top bits; one short
+/// mutex acquisition per *fresh* state is the only cross-thread write on
+/// the exploration hot path.
+struct ShardedFpSet {
+    shards: Box<[std::sync::Mutex<hashbrown::HashTable<u64>>]>,
+}
+
+const FP_SHARDS: usize = 256;
+
+impl ShardedFpSet {
+    fn new() -> Self {
+        ShardedFpSet {
+            shards: (0..FP_SHARDS)
+                .map(|_| std::sync::Mutex::new(hashbrown::HashTable::new()))
+                .collect(),
+        }
+    }
+
+    /// Insert; returns true if the fingerprint was fresh.
+    fn insert(&self, fp: u64) -> bool {
+        let mut shard = self.shards[(fp >> 56) as usize & (FP_SHARDS - 1)].lock().unwrap();
+        if shard.find(fp, |&e| e == fp).is_some() {
+            return false;
+        }
+        shard.insert_unique(fp, fp, |&e| e);
+        true
+    }
+
+    fn len(&self) -> u64 {
+        self.shards.iter().map(|s| s.lock().unwrap().len() as u64).sum()
+    }
+}
+
+enum ParOutcome {
+    Pass { states: u64, max_depth: u32 },
+    Incomplete { states: u64 },
+    /// A violation, deadlock or evaluation error was detected — redo
+    /// sequentially for the deterministic trace/report.
+    Rerun,
+}
+
+/// Level-synchronized parallel BFS. Work stealing: each level's frontier
+/// is a flat state array split into fixed-size chunks; workers claim
+/// chunks with one `fetch_add` (dynamic load balance without deques).
+/// Everything a worker touches per state — Vm, ChoiceCtl, output buffer —
+/// is thread-private; the shared surface is the immutable `Program`, the
+/// sharded seen-set and the (read-only) current frontier.
+fn check_parallel(spec: &CompiledSpec, cfg: &CheckConfig) -> ParOutcome {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    let n_vars = spec.vars.len();
+    let fps = ShardedFpSet::new();
+    let stop = AtomicBool::new(false);
+    let capped = AtomicBool::new(false);
+    let discovered = AtomicU64::new(0);
+
+    // Initial states: sequential (the set is tiny).
+    let mut frontier: Vec<Value> = Vec::new();
+    {
+        let mut vm = spec.make_vm();
+        let initial = match enumerate(&mut vm, spec.init, None) {
+            Ok(v) => v,
+            Err(_) => return ParOutcome::Rerun,
+        };
+        for state in initial {
+            if !fps.insert(FpSet::fingerprint(&state)) {
+                continue;
+            }
+            match check_invs(spec, &mut vm, &state) {
+                Ok(None) => {}
+                _ => return ParOutcome::Rerun,
+            }
+            frontier.extend_from_slice(&state);
+            discovered.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// States per work unit: small enough to balance uneven successor
+    /// costs, large enough that the claim `fetch_add` is noise.
+    const CHUNK: usize = 256;
+
+    let mut depth: u32 = 0;
+    let mut last_report = std::time::Instant::now();
+
+    while !frontier.is_empty() {
+        if cfg.max_steps.is_some_and(|max| depth >= max) {
+            break;
+        }
+        let n_states = frontier.len() / n_vars;
+        let cursor = AtomicUsize::new(0);
+        let frontier_ref = &frontier;
+
+        let outs: Vec<Vec<Value>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..cfg.threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut vm = spec.make_vm();
+                        let mut out: Vec<Value> = Vec::new();
+                        'chunks: loop {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let c = cursor.fetch_add(1, Ordering::Relaxed);
+                            let lo = c * CHUNK;
+                            if lo >= n_states {
+                                break;
+                            }
+                            let hi = (lo + CHUNK).min(n_states);
+                            for i in lo..hi {
+                                let state = &frontier_ref[i * n_vars..(i + 1) * n_vars];
+                                let succs = match enumerate(&mut vm, spec.step, Some(state)) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        stop.store(true, Ordering::Relaxed);
+                                        break 'chunks;
+                                    }
+                                };
+                                if succs.is_empty() && cfg.deadlock {
+                                    stop.store(true, Ordering::Relaxed);
+                                    break 'chunks;
+                                }
+                                let mut fresh = 0u64;
+                                for succ in succs {
+                                    if !fps.insert(FpSet::fingerprint(&succ)) {
+                                        continue;
+                                    }
+                                    fresh += 1;
+                                    match check_invs(spec, &mut vm, &succ) {
+                                        Ok(None) => {}
+                                        _ => {
+                                            stop.store(true, Ordering::Relaxed);
+                                            break 'chunks;
+                                        }
+                                    }
+                                    out.extend_from_slice(&succ);
+                                }
+                                if fresh > 0 {
+                                    let total = discovered.fetch_add(fresh, Ordering::Relaxed) + fresh;
+                                    if cfg.max_states.is_some_and(|max| total >= max) {
+                                        capped.store(true, Ordering::Relaxed);
+                                        stop.store(true, Ordering::Relaxed);
+                                        break 'chunks;
+                                    }
+                                }
+                            }
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        if stop.load(Ordering::Relaxed) {
+            if capped.load(Ordering::Relaxed) {
+                return ParOutcome::Incomplete {
+                    states: discovered.load(Ordering::Relaxed),
+                };
+            }
+            return ParOutcome::Rerun;
+        }
+
+        frontier.clear();
+        for out in outs {
+            frontier.extend_from_slice(&out);
+        }
+        if !frontier.is_empty() {
+            depth += 1;
+        }
+
+        if last_report.elapsed().as_secs() >= 1 {
+            eprintln!(
+                "  {} states, depth {}, frontier {} ({} threads)",
+                discovered.load(Ordering::Relaxed),
+                depth,
+                frontier.len() / n_vars,
+                cfg.threads,
+            );
+            last_report = std::time::Instant::now();
+        }
+    }
+
+    ParOutcome::Pass {
+        states: fps.len(),
+        max_depth: depth,
+    }
+}
+
 fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<CheckError>> {
+    let mut vm = spec.make_vm();
     let mut fps = FpSet::default();
     // discovery index -> parent discovery index (the only per-state data
     // besides the fingerprint)
@@ -149,7 +362,7 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
         })
     };
 
-    let initial = enumerate(&spec.init, &spec.storage, None)
+    let initial = enumerate(&mut vm, spec.init, None)
         .map_err(|e| err_with(&parents, None, e))?;
     for state in initial {
         if !fps.insert(FpSet::fingerprint(&state)) {
@@ -157,7 +370,7 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
         }
         let idx = parents.len() as u32;
         parents.push(NO_PARENT);
-        match check_invs(spec, &state) {
+        match check_invs(spec, &mut vm, &state) {
             Ok(Some(invariant)) => {
                 return Ok(CheckOutcome::InvariantViolation {
                     invariant,
@@ -180,7 +393,7 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
             continue;
         }
 
-        let successors = enumerate(&spec.step, &spec.storage, Some(&state_buf))
+        let successors = enumerate(&mut vm, spec.step, Some(&state_buf))
             .map_err(|e| err_with(&parents, Some(idx), e))?;
 
         if successors.is_empty() && cfg.deadlock {
@@ -195,7 +408,7 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
             }
             let succ_idx = parents.len() as u32;
             parents.push(idx);
-            match check_invs(spec, &succ) {
+            match check_invs(spec, &mut vm, &succ) {
                 Ok(Some(invariant)) => {
                     return Ok(CheckOutcome::InvariantViolation {
                         invariant,
@@ -242,6 +455,7 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
 /// and stop as soon as the target — the largest index on the path — is
 /// discovered. Costs one extra traversal, paid only when reporting.
 fn reconstruct(spec: &CompiledSpec, cfg: &CheckConfig, parents: &[u32], target: u32) -> Vec<State> {
+    let mut vm = spec.make_vm();
     let mut path = vec![target];
     let mut cur = target;
     while parents[cur as usize] != NO_PARENT {
@@ -265,7 +479,7 @@ fn reconstruct(spec: &CompiledSpec, cfg: &CheckConfig, parents: &[u32], target: 
     let mut frontier = FlatFrontier::new(spec.vars.len());
     let mut state_buf: Vec<Value> = Vec::with_capacity(spec.vars.len());
 
-    let initial = enumerate(&spec.init, &spec.storage, None)
+    let initial = enumerate(&mut vm, spec.init, None)
         .expect("reconstruction diverged from the original run (init)");
     'outer: {
         for state in initial {
@@ -284,7 +498,7 @@ fn reconstruct(spec: &CompiledSpec, cfg: &CheckConfig, parents: &[u32], target: 
             if cfg.max_steps.is_some_and(|max| depth >= max) {
                 continue;
             }
-            let successors = enumerate(&spec.step, &spec.storage, Some(&state_buf))
+            let successors = enumerate(&mut vm, spec.step, Some(&state_buf))
                 .expect("reconstruction diverged from the original run (step)");
             for succ in successors {
                 if !fps.insert(FpSet::fingerprint(&succ)) {
@@ -312,6 +526,7 @@ fn reconstruct(spec: &CompiledSpec, cfg: &CheckConfig, parents: &[u32], target: 
 // ---------------------------------------------------------------------------
 
 fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<CheckError>> {
+    let mut vm = spec.make_vm();
     let mut arena = StateArena::new(spec.vars.len());
     let mut seen = SeenSet::default();
     let mut frontier: VecDeque<u32> = VecDeque::new();
@@ -325,12 +540,12 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
     };
 
     // Initial states
-    let initial = enumerate(&spec.init, &spec.storage, None)
+    let initial = enumerate(&mut vm, spec.init, None)
         .map_err(|e| err_with(&arena, None, e))?;
     for state in initial {
         let (id, fresh) = seen.insert_or_get(&mut arena, &state, None, 0);
         debug_assert!(fresh, "enumerate returns deduplicated states");
-        match check_invs(spec, &state) {
+        match check_invs(spec, &mut vm, &state) {
             Ok(Some(invariant)) => {
                 return Ok(CheckOutcome::InvariantViolation {
                     invariant,
@@ -357,7 +572,7 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
         state_buf.clear();
         state_buf.extend_from_slice(arena.get(id));
 
-        let successors = enumerate(&spec.step, &spec.storage, Some(&state_buf))
+        let successors = enumerate(&mut vm, spec.step, Some(&state_buf))
             .map_err(|e| err_with(&arena, Some(id), e))?;
 
         if successors.is_empty() && cfg.deadlock {
@@ -371,7 +586,7 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
             if !fresh {
                 continue;
             }
-            match check_invs(spec, &succ) {
+            match check_invs(spec, &mut vm, &succ) {
                 Ok(Some(invariant)) => {
                     return Ok(CheckOutcome::InvariantViolation {
                         invariant,

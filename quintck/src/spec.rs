@@ -1,19 +1,19 @@
 //! Entry-point resolution and compilation of a checkable spec.
 
-use crate::eval::{CompiledExpr, Env};
-use crate::state::{VarStorage, VarTable};
+use crate::eval::Env;
+use crate::state::VarTable;
 use crate::value::{EvalResult, Value};
-use crate::vm::Lowerer;
+use crate::vm::{FnId, Lowerer, Program, Vm};
 use quint_ast::{CompiledOutput, Declaration, OpDef, OpQualifier, QuintName};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub struct CompiledSpec {
     pub vars: VarTable,
-    pub storage: Rc<RefCell<VarStorage>>,
-    pub init: CompiledExpr,
-    pub step: CompiledExpr,
-    pub invariants: Vec<(QuintName, CompiledExpr)>,
+    /// Immutable compiled program; workers share it by reference and each
+    /// own their evaluation state ([`CompiledSpec::make_vm`]).
+    pub program: Program,
+    pub init: FnId,
+    pub step: FnId,
+    pub invariants: Vec<(QuintName, FnId)>,
     pub temporal: Vec<crate::temporal::Property>,
     pub atoms: crate::temporal::AtomTable,
 }
@@ -136,11 +136,11 @@ impl CompiledSpec {
             temporal.push(prop);
         }
         let atoms = parser.atoms;
-        let storage = compiler.storage();
+        let program = compiler.finish();
 
         Ok(CompiledSpec {
             vars,
-            storage,
+            program,
             init,
             step,
             invariants,
@@ -149,10 +149,15 @@ impl CompiledSpec {
         })
     }
 
+    /// A fresh, thread-private evaluation state over this spec's program.
+    pub fn make_vm(&self) -> Vm<'_> {
+        Vm::new(&self.program)
+    }
+
     /// Evaluate one invariant against a state (no nondeterminism allowed).
-    pub fn eval_invariant_at(&self, state: &[Value], inv: &CompiledExpr) -> EvalResult {
-        self.storage.borrow().load(state);
-        let mut env = Env::new(self.storage.clone(), None);
-        inv.execute(&mut env)
+    pub fn eval_invariant_at(&self, vm: &mut Vm, state: &[Value], inv: FnId) -> EvalResult {
+        vm.load(state);
+        let mut env = Env::new(None);
+        vm.run(&mut env, inv)
     }
 }

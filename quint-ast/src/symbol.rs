@@ -6,68 +6,89 @@
 //! container ordered by name enumerates in the same order as the previous
 //! `Arc<str>` representation (Display, ITF traces, `pick` order).
 //!
-//! The table is thread-local: the checker is single-threaded, and `cargo
-//! test` gets per-thread isolation for free. Interned strings are leaked, so
-//! `as_str` hands out `&'static str`.
+//! The table is a process-global concurrent interner: interning (rare —
+//! essentially only while loading the IR) takes one mutex; `as_str` reads
+//! are lock-free through an append-only [`Slab`]; `Ord` reads a rank
+//! snapshot published through an `AtomicPtr` (rebuilt lazily after new
+//! interns, then immutable — old snapshots are leaked). Interned strings
+//! are leaked, so `as_str` hands out `&'static str`.
 
+use crate::slab::Slab;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering as AO};
+use std::sync::Mutex;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Symbol(NonZeroU32);
 
-struct SymbolTable {
-    map: FxHashMap<&'static str, Symbol>,
-    strs: Vec<&'static str>,
-    /// String-order rank per symbol index; rebuilt lazily after interning
-    /// (the symbol set is essentially frozen once the IR is loaded, so the
-    /// rebuild is amortized to nothing and `Ord` becomes two integer loads).
-    ranks: Vec<u32>,
-    ranks_dirty: bool,
+struct SymbolStore {
+    map: Mutex<FxHashMap<&'static str, Symbol>>,
+    strs: Slab<&'static str>,
+    len: AtomicU32,
+    /// String-order rank snapshot (leaked; null until first build). Covers
+    /// exactly `ranks_len` symbols — reads that need more rebuild it.
+    ranks: AtomicPtr<u32>,
+    ranks_len: AtomicU32,
 }
 
-impl SymbolTable {
-    fn rebuild_ranks(&mut self) {
-        let mut order: Vec<u32> = (0..self.strs.len() as u32).collect();
-        order.sort_unstable_by_key(|&i| self.strs[i as usize]);
-        self.ranks.resize(self.strs.len(), 0);
-        for (rank, &i) in order.iter().enumerate() {
-            self.ranks[i as usize] = rank as u32;
+static STORE: SymbolStore = SymbolStore {
+    map: Mutex::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher)),
+    strs: Slab::new(),
+    len: AtomicU32::new(0),
+    ranks: AtomicPtr::new(std::ptr::null_mut()),
+    ranks_len: AtomicU32::new(0),
+};
+
+impl SymbolStore {
+    /// Rank snapshot covering at least `need` symbols, rebuilding once
+    /// under the intern lock if the current one is stale.
+    fn ranks_for(&self, need: u32) -> *const u32 {
+        loop {
+            if self.ranks_len.load(AO::Acquire) >= need {
+                return self.ranks.load(AO::Acquire);
+            }
+            let _guard = self.map.lock().unwrap();
+            if self.ranks_len.load(AO::Acquire) >= need {
+                continue; // rebuilt while we waited for the lock
+            }
+            let len = self.len.load(AO::Acquire);
+            let mut order: Vec<u32> = (0..len).collect();
+            order.sort_unstable_by_key(|&i| *self.strs.get(i));
+            let mut ranks = vec![0u32; len as usize];
+            for (rank, &i) in order.iter().enumerate() {
+                ranks[i as usize] = rank as u32;
+            }
+            let leaked: &'static mut [u32] = Box::leak(ranks.into_boxed_slice());
+            self.ranks.store(leaked.as_mut_ptr(), AO::Release);
+            self.ranks_len.store(len, AO::Release);
         }
-        self.ranks_dirty = false;
     }
-}
-
-thread_local! {
-    static SYMBOLS: RefCell<SymbolTable> = RefCell::new(SymbolTable {
-        map: FxHashMap::default(),
-        strs: Vec::new(),
-        ranks: Vec::new(),
-        ranks_dirty: false,
-    });
 }
 
 impl Symbol {
     pub fn intern(s: &str) -> Symbol {
-        SYMBOLS.with_borrow_mut(|t| {
-            if let Some(&sym) = t.map.get(s) {
-                return sym;
-            }
-            let leaked: &'static str = Box::leak(s.into());
-            let sym = Symbol(NonZeroU32::new(t.strs.len() as u32 + 1).unwrap());
-            t.strs.push(leaked);
-            t.map.insert(leaked, sym);
-            t.ranks_dirty = true;
-            sym
-        })
+        let mut map = STORE.map.lock().unwrap();
+        if let Some(&sym) = map.get(s) {
+            return sym;
+        }
+        let leaked: &'static str = Box::leak(s.into());
+        let idx = STORE.len.load(AO::Relaxed);
+        let sym = Symbol(NonZeroU32::new(idx + 1).unwrap());
+        // Safety: idx is claimed under the lock; the release store of
+        // `len` (and the lock release) publish the slot before anyone can
+        // learn this symbol.
+        unsafe { STORE.strs.write(idx, leaked) };
+        STORE.len.store(idx + 1, AO::Release);
+        map.insert(leaked, sym);
+        sym
     }
 
     pub fn as_str(self) -> &'static str {
-        SYMBOLS.with_borrow(|t| t.strs[self.0.get() as usize - 1])
+        STORE.strs.get(self.0.get() - 1)
     }
 }
 
@@ -104,18 +125,22 @@ impl PartialOrd for Symbol {
 
 /// String order, not id order: keeps name-keyed containers enumerating in
 /// the same order as the old `Arc<str>` representation. Compares via the
-/// cached ranks (no string traversal).
+/// rank snapshot (no string traversal, no lock on the hot path).
 impl Ord for Symbol {
     fn cmp(&self, other: &Self) -> Ordering {
         if self.0 == other.0 {
             return Ordering::Equal;
         }
-        SYMBOLS.with_borrow_mut(|t| {
-            if t.ranks_dirty {
-                t.rebuild_ranks();
-            }
-            t.ranks[self.0.get() as usize - 1].cmp(&t.ranks[other.0.get() as usize - 1])
-        })
+        let need = self.0.get().max(other.0.get());
+        let ranks = STORE.ranks_for(need);
+        // Safety: the snapshot covers `need` symbols and is immutable.
+        let (ra, rb) = unsafe {
+            (
+                *ranks.add(self.0.get() as usize - 1),
+                *ranks.add(other.0.get() as usize - 1),
+            )
+        };
+        ra.cmp(&rb)
     }
 }
 
@@ -173,6 +198,9 @@ mod tests {
         let a = Symbol::intern("aaa");
         assert!(a < z);
         assert_eq!(a.cmp(&a), Ordering::Equal);
+        // interning after a rank rebuild still orders correctly
+        let m = Symbol::intern("mmm");
+        assert!(a < m && m < z);
     }
 
     #[test]

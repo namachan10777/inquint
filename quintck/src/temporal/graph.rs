@@ -88,7 +88,7 @@ pub fn build(
     let mut vars_vals: Vec<Vec<Value>> = vec![Vec::new(); atoms.vars_exprs.len()];
     let mut seen = SeenSet::default();
 
-    let storage = &spec.storage;
+    let mut vm = spec.make_vm();
 
     let fail = |g: &StateGraph, id: Option<u32>, error: QuintError| {
         Box::new(CheckError {
@@ -105,12 +105,12 @@ pub fn build(
             if !fresh {
                 Ok::<u32, Box<CheckError>>(id)
             } else {
-                storage.borrow().load(state);
-                let mut env = Env::new(storage.clone(), None);
+                vm.load(state);
+                let mut env = Env::new(None);
                 for (i, atom) in atoms.state_atoms.iter().enumerate() {
                     let bit = match atom {
                         StateAtom::Pred(p) => p
-                            .eval(&mut env)
+                            .eval(&mut vm, &mut env)
                             .map_err(|e| fail(&$g, Some(id), e))?
                             .as_bool(),
                         // Enabled atoms need successor enumeration;
@@ -124,7 +124,7 @@ pub fn build(
                     // stored values are compared with `==` (id equality
                     // is only sound on normalized values)
                     let value = v
-                        .eval(&mut env)
+                        .eval(&mut vm, &mut env)
                         .and_then(|v| v.normalize())
                         .map_err(|e| fail(&$g, Some(id), e))?;
                     vars_vals[i].push(value);
@@ -136,7 +136,7 @@ pub fn build(
 
     // Initial states
     let initial =
-        enumerate(&spec.init, storage, None).map_err(|e| fail(&g, None, e))?;
+        enumerate(&mut vm, spec.init, None).map_err(|e| fail(&g, None, e))?;
     for state in initial {
         intern!(g, &state, None, 0)?;
     }
@@ -173,7 +173,7 @@ pub fn build(
 
         // 1. step successors (strict)
         let successors =
-            enumerate(&spec.step, storage, Some(&s)).map_err(|e| fail(&g, Some(s_id), e))?;
+            enumerate(&mut vm, spec.step, Some(&s)).map_err(|e| fail(&g, Some(s_id), e))?;
         if successors.is_empty() && cfg.deadlock {
             return Ok(GraphOutcome::Deadlock {
                 trace: g.trace_to(s_id),
@@ -183,7 +183,7 @@ pub fn build(
         // 2. sub-action transition predicates for atoms
         let mut t_a: BTreeMap<u32, SubActionRuns> = BTreeMap::new();
         for &a in &used_actions {
-            let runs = enumerate_partial(&atoms.actions[a as usize], storage, &s)
+            let runs = enumerate_partial(&mut vm, &atoms.actions[a as usize], &s)
                 .map_err(|e| fail(&g, Some(s_id), e))?;
             t_a.insert(a, runs);
         }
@@ -199,10 +199,10 @@ pub fn build(
                     let mut any = false;
                     for t in runs.framed(&s) {
                         // v(t): evaluate against t (throwaway states are legal)
-                        storage.borrow().load(&t);
-                        let mut env = Env::new(storage.clone(), None);
+                        vm.load(&t);
+                        let mut env = Env::new(None);
                         let vt = atoms.vars_exprs[v]
-                            .eval(&mut env)
+                            .eval(&mut vm, &mut env)
                             .and_then(|v| v.normalize())
                             .map_err(|e| fail(&g, Some(s_id), e))?;
                         if vt != vars_vals[v][i] {
@@ -231,9 +231,9 @@ pub fn build(
 
         for (t, &t_id) in target_states.iter().zip(&target_ids) {
             // NextPred atoms need current = s, next bank = t
-            storage.borrow().load(&s);
-            storage.borrow().load_next(t);
-            let mut env = Env::new(storage.clone(), None);
+            vm.load(&s);
+            vm.load_next(t);
+            let mut env = Env::new(None);
             env.next_allowed = true;
             for (ai, atom) in atoms.edge_atoms.iter().enumerate() {
                 let bit = match atom {
@@ -248,7 +248,7 @@ pub fn build(
                                 == vars_vals[*vars as usize][i]
                     }
                     EdgeAtom::NextPred(p) => p
-                        .eval(&mut env)
+                        .eval(&mut vm, &mut env)
                         .map_err(|e| fail(&g, Some(s_id), e))?
                         .as_bool(),
                 };
@@ -276,14 +276,14 @@ pub fn build(
     // Invariants: check on every state (after the fact, states are loaded
     // once more; done here to keep the intern macro simple).
     for id in 0..g.arena.len() as u32 {
-        for (name, inv) in &spec.invariants {
+        for &(name, inv) in &spec.invariants {
             let holds = spec
-                .eval_invariant_at(g.arena.get(id), inv)
+                .eval_invariant_at(&mut vm, g.arena.get(id), inv)
                 .map_err(|e| fail(&g, Some(id), e))?
                 .as_bool();
             if !holds {
                 return Ok(GraphOutcome::InvariantViolation {
-                    invariant: *name,
+                    invariant: name,
                     trace: g.trace_to(id),
                 });
             }

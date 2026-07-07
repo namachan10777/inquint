@@ -5,6 +5,7 @@
 //! resolves through the [`LookupTable`] by the reference node's id. Builtin
 //! operators are *not* in the table — they are dispatched by opcode string.
 
+pub mod slab;
 pub mod ir;
 pub mod output;
 pub mod symbol;
