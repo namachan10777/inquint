@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Differential test: quintck's native temporal verdicts vs quint's TLC
+# Differential test: inquint's native temporal verdicts vs quint's TLC
 # backend on the same properties. The two TLC-unparseable properties
 # (verNeverDecreases: next-atom; brokenAlwaysProgress: mustChange) are
 # pinned to their Apalache-verified expectations and skipped on TLC.
@@ -8,13 +8,13 @@
 # once), no other Apalache-backend runs in parallel.
 set -u -o pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 echo "== building =="
 cargo build -q --release || exit 1
-Q=target/release/quintck
+Q=target/release/inquint
 
-# file|main|init|step|temporal|fixture|quintck-extra
+# file|main|init|step|temporal|fixture|inquint-extra
 CASES=$(cat <<'EOF'
 specs/TwoPhaseCommit.qnt|main|||decisionReached,committedPropagates|TwoPhaseCommit_temporal.json|
 specs/TwoPhaseCommit.qnt|main|||brokenDecisionNoFairness|TwoPhaseCommit_temporal.json|
@@ -68,11 +68,11 @@ while IFS='|' read -r file main init step temporal fixture extra; do
   qk=$(verdict_of $? "$qk_out")
 
   if [[ "$tlc" == "$qk" ]]; then
-    printf "[ok]   %-28s tlc=%s quintck=%s\n" "$temporal" "$tlc" "$qk"
+    printf "[ok]   %-28s tlc=%s inquint=%s\n" "$temporal" "$tlc" "$qk"
   else
-    printf "[DIFF] %-28s tlc=%s quintck=%s (%s)\n" "$temporal" "$tlc" "$qk" "$file"
+    printf "[DIFF] %-28s tlc=%s inquint=%s (%s)\n" "$temporal" "$tlc" "$qk" "$file"
     echo "--- tlc: $(tail -2 <<<"$tlc_out")"
-    echo "--- quintck: $(tail -1 <<<"$qk_out")"
+    echo "--- inquint: $(tail -1 <<<"$qk_out")"
     failures=$((failures + 1))
   fi
 done <<<"$CASES"

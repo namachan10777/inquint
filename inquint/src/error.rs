@@ -28,7 +28,7 @@ impl QuintError {
 
 /// QNT501: construct not supported by this runtime.
 pub fn unsupported(what: impl std::fmt::Display) -> QuintError {
-    QuintError::new("QNT501", format!("{what} is not supported by quintck"))
+    QuintError::new("QNT501", format!("{what} is not supported by inquint"))
 }
 
 /// QNT502: reading a state variable that has no value yet (during init).
@@ -40,6 +40,6 @@ pub fn undefined_var(name: &str) -> QuintError {
 pub fn overflow(op: &str) -> QuintError {
     QuintError::new(
         "QNT601",
-        format!("integer overflow in {op} (quintck v1 uses 64-bit integers)"),
+        format!("integer overflow in {op} (inquint v1 uses 64-bit integers)"),
     )
 }

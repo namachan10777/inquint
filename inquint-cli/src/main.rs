@@ -1,12 +1,12 @@
 use clap::Parser;
-use quintck::explorer::{check, CheckConfig, CheckOutcome};
-use quintck::spec::{CompiledSpec, EntryPoints};
+use inquint::explorer::{check, CheckConfig, CheckOutcome};
+use inquint::spec::{CompiledSpec, EntryPoints};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod compile;
 
-/// quintck — explicit-state (TLC-like) model checker for Quint.
+/// inquint — explicit-state (TLC-like) model checker for Quint.
 ///
 /// Accepts a .qnt file (compiled via the `quint` CLI, which must be on
 /// PATH) or a pre-compiled .json file (`quint compile --target=json`).
@@ -109,7 +109,7 @@ fn main() -> ExitCode {
     };
 
     if let Some(test_names) = &cli.test {
-        return match quintck::runner::run_tests(&output, test_names) {
+        return match inquint::runner::run_tests(&output, test_names) {
             Ok(reports) => {
                 let mut failed = 0;
                 for report in &reports {
@@ -172,15 +172,15 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let states = quintck::explorer::por_probe(&spec, &cfg, elem);
+        let states = inquint::explorer::por_probe(&spec, &cfg, elem);
         println!("[probe:{gran}] {states} states explored (UNSOUND upper-bound probe)");
         return ExitCode::SUCCESS;
     }
 
     let source = cli.input.display().to_string();
-    let write_itf = |trace: &[quintck::state::State], violation: bool| {
+    let write_itf = |trace: &[inquint::state::State], violation: bool| {
         if let Some(path) = &cli.out_itf {
-            let itf = quintck::itf_out::trace_to_itf(&spec.vars.names, trace, violation, &source);
+            let itf = inquint::itf_out::trace_to_itf(&spec.vars.names, trace, violation, &source);
             match serde_json::to_string_pretty(&itf) {
                 Ok(json) => {
                     if let Err(e) = std::fs::write(path, json) {
@@ -192,7 +192,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let print_trace = |trace: &[quintck::state::State]| {
+    let print_trace = |trace: &[inquint::state::State]| {
         for (i, state) in trace.iter().enumerate() {
             eprintln!("State {i}:");
             for (name, value) in spec.vars.names.iter().zip(state.iter()) {
@@ -202,7 +202,7 @@ fn main() -> ExitCode {
     };
 
     if !spec.temporal.is_empty() {
-        use quintck::temporal::{check_temporal, TemporalOutcome};
+        use inquint::temporal::{check_temporal, TemporalOutcome};
         if cfg.max_steps.is_some() {
             eprintln!("warning: temporal checking requires exhaustive exploration; ignoring --max-steps");
         }
@@ -235,7 +235,7 @@ fn main() -> ExitCode {
                     }
                 }
                 if let Some(path) = &cli.out_itf {
-                    let mut itf = quintck::itf_out::trace_to_itf(
+                    let mut itf = inquint::itf_out::trace_to_itf(
                         &spec.vars.names,
                         &lasso.states,
                         true,

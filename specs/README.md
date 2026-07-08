@@ -59,7 +59,7 @@ Notes on scope:
 
 `TemporalLab.qnt` holds three tiny machines with *known* liveness
 counterexample shapes, used as deterministic detection tests for temporal
-checkers (quintck-only, not part of `check.sh`): a pure stuttering lasso, a
+checkers (inquint-only, not part of `check.sh`): a pure stuttering lasso, a
 real-cycle lasso (mod-3 counter), and a weak-vs-strong-fairness
 discriminator (an action enabled only intermittently along the fair cycle).
 
@@ -67,8 +67,8 @@ discriminator (an action enabled only intermittently along the fair cycle).
 
 Each spec additionally defines a `module bench` — a much larger instance
 (e.g. Raft with 5 terms, dining with 12 philosophers, 2PC with 8 RMs) used
-as a performance benchmark by the quintck explicit-state checker
-(`quintck-bench.sh` at the repo root; each bench is sized to take roughly
+as a performance benchmark by the inquint explicit-state checker
+(`scripts/inquint-bench.sh`; each bench is sized to take roughly
 a minute unoptimized). These instances are **not** part of `check.sh`:
 they are far too large for Apalache/TLC.
 

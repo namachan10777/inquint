@@ -4,9 +4,9 @@
 //! self-check inside check_liveness validates every extracted lasso
 //! against the negated property.
 
-use quintck::explorer::CheckConfig;
-use quintck::spec::{CompiledSpec, EntryPoints};
-use quintck::temporal::{check_temporal, TemporalOutcome};
+use inquint::explorer::CheckConfig;
+use inquint::spec::{CompiledSpec, EntryPoints};
+use inquint::temporal::{check_temporal, TemporalOutcome};
 use std::path::PathBuf;
 
 fn build(fixture: &str, temporal: &[&str], init: Option<&str>, step: Option<&str>) -> CompiledSpec {

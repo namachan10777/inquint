@@ -1,7 +1,7 @@
 //! `run` definition execution (quint's unit tests: init.then(...).expect(...)).
 //!
 //! Unlike `quint test`, which samples nondeterministic choices randomly,
-//! quintck enumerates the run's entire choice tree: the test passes only
+//! inquint enumerates the run's entire choice tree: the test passes only
 //! if EVERY path through its nondeterminism succeeds.
 
 use crate::choice::ChoiceCtl;

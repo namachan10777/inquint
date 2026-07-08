@@ -354,6 +354,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "inquint"
+version = "0.1.0"
+dependencies = [
+ "foldhash",
+ "hashbrown 0.15.5",
+ "itf",
+ "quint-ast",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "inquint-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "inquint",
+ "quint-ast",
+ "serde_json",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,30 +507,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
-]
-
-[[package]]
-name = "quintck"
-version = "0.1.0"
-dependencies = [
- "foldhash",
- "hashbrown 0.15.5",
- "itf",
- "quint-ast",
- "rustc-hash",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "quintck-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "quint-ast",
- "quintck",
- "serde_json",
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ pub fn load_input(input: &Path, opts: &QntOptions) -> Result<String, String> {
             // when node exits with pending async writes, so redirect stdout
             // into a temp file instead — file writes are synchronous.
             let tmp = std::env::temp_dir().join(format!(
-                "quintck-compile-{}.json",
+                "inquint-compile-{}.json",
                 std::process::id()
             ));
             let stdout_file = std::fs::File::create(&tmp)

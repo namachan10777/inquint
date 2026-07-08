@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["quint-ast", "quintck", "quintck-cli"]
+members = ["quint-ast", "inquint", "inquint-cli"]
 
 [workspace.package]
 version = "0.1.0"

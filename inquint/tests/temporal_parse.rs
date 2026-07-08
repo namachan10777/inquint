@@ -1,7 +1,7 @@
 //! M1 gate: every temporal property in the corpus translates to the
 //! expected fairness + LTL structure.
 
-use quintck::spec::{CompiledSpec, EntryPoints};
+use inquint::spec::{CompiledSpec, EntryPoints};
 use std::path::PathBuf;
 
 fn build(fixture: &str, temporal: &[&str]) -> CompiledSpec {

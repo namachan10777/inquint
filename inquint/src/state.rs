@@ -90,7 +90,7 @@ impl FpSet {
     /// 64-bit avalanche (FxHash would not qualify).
     pub fn fingerprint(s: &[Value]) -> u64 {
         use std::hash::BuildHasher;
-        const FP_SEED: u64 = 0x5155_494e_5443_4b21; // "QUINTCK!"
+        const FP_SEED: u64 = 0x494e_5155_494e_5421; // "INQUINT!"
         foldhash::fast::FixedState::with_seed(FP_SEED).hash_one(s)
     }
 

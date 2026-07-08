@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["polars"]
 # ///
-"""Benchmark quintck (per thread count) and quint's TLC backend over the
+"""Benchmark inquint (per thread count) and quint's TLC backend over the
 bench corpus, appending one row per run to bench/results.parquet.
 
 Usage:
@@ -28,19 +28,19 @@ ROOT = Path(__file__).resolve().parent.parent
 @dataclass
 class Spec:
     name: str
-    quintck_args: list[str]  # after the fixture path
+    inquint_args: list[str]  # after the fixture path
     exhaustive: bool  # True → TLC runs the same (complete) search
     invariants: str  # quint verify --invariant argument
-    # depth bound handed to apalache (= quintck's --max-steps for capped
+    # depth bound handed to apalache (= inquint's --max-steps for capped
     # specs, the measured diameter for exhaustive ones). Apalache is a
     # bounded symbolic checker, so this is "verify up to depth K".
     bound_steps: int
 
 
-# Mirrors quintck-bench.sh (args) and fixtures/regen.sh (invariants).
-# Every instance is finite and fully explored (--exhaustive): quintck and
+# Mirrors scripts/inquint-bench.sh (args) and fixtures/regen.sh (invariants).
+# Every instance is finite and fully explored (--exhaustive): inquint and
 # TLC do identical work. bound_steps records the measured diameter, used
-# as apalache's depth bound. Sized so quintck (all cores) takes ~15-80s.
+# as apalache's depth bound. Sized so inquint (all cores) takes ~15-80s.
 SPECS = [
     Spec("TeachingConcurrency", ["--exhaustive"], True, "correctness", 16),
     Spec("ClockSync", ["--exhaustive"], True, "skewOK", 73),
@@ -109,12 +109,12 @@ def base_row(spec: Spec, backend: str, threads: int, rep: int, commit: str) -> d
     }
 
 
-def bench_quintck(spec: Spec, threads: int, rep: int, commit: str, timeout: float) -> dict:
-    row = base_row(spec, "quintck", threads, rep, commit)
+def bench_inquint(spec: Spec, threads: int, rep: int, commit: str, timeout: float) -> dict:
+    row = base_row(spec, "inquint", threads, rep, commit)
     cmd = [
-        str(ROOT / "target/release/quintck"),
+        str(ROOT / "target/release/inquint"),
         str(ROOT / f"fixtures/bench_{spec.name}.json"),
-        *spec.quintck_args,
+        *spec.inquint_args,
         "--threads",
         str(threads),
     ]
@@ -194,7 +194,7 @@ def main() -> int:
     ap.add_argument(
         "--threads",
         default=",".join(map(str, default_threads)),
-        help="comma-separated quintck thread counts",
+        help="comma-separated inquint thread counts",
     )
     ap.add_argument("--skip-tlc", action="store_true")
     ap.add_argument("--skip-apalache", action="store_true")
@@ -235,7 +235,7 @@ def main() -> int:
     for rep in range(args.reps):
         for spec in specs:
             for t in thread_counts:
-                record(bench_quintck(spec, t, rep, commit, args.timeout))
+                record(bench_inquint(spec, t, rep, commit, args.timeout))
         if not args.skip_tlc:
             # TLC explores the complete state space: an equal-work
             # comparison for exhaustive specs; for capped specs it does

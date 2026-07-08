@@ -1,9 +1,9 @@
 //! Correctness gate: check the specs corpus fixtures and assert exact
 //! outcomes, including counterexample depths and successor counts.
 
-use quintck::explorer::{check, CheckConfig, CheckOutcome};
-use quintck::spec::{CompiledSpec, EntryPoints};
-use quintck::successor::enumerate;
+use inquint::explorer::{check, CheckConfig, CheckOutcome};
+use inquint::spec::{CompiledSpec, EntryPoints};
+use inquint::successor::enumerate;
 use std::path::PathBuf;
 
 fn load(name: &str) -> quint_ast::CompiledOutput {
@@ -225,7 +225,7 @@ fn itf_roundtrip() {
     let CheckOutcome::InvariantViolation { trace, .. } = outcome else {
         panic!("expected violation");
     };
-    let itf = quintck::itf_out::trace_to_itf(&broken.vars.names, &trace, true, "test");
+    let itf = inquint::itf_out::trace_to_itf(&broken.vars.names, &trace, true, "test");
     let json = serde_json::to_string(&itf).unwrap();
     let parsed: itf::Trace<itf::Value> = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.states.len(), trace.len());
@@ -247,21 +247,21 @@ fn parallel_agrees_with_sequential() {
             deadlock: false,
             ..cfg(Some(6))
         };
-        let unpack = |r: Result<quintck::explorer::CheckOutcome, Box<quintck::explorer::CheckError>>, mode: &str| match r {
-            Ok(quintck::explorer::CheckOutcome::Pass { states, max_depth }) => (states, max_depth),
-            Ok(quintck::explorer::CheckOutcome::InvariantViolation { .. }) => {
+        let unpack = |r: Result<inquint::explorer::CheckOutcome, Box<inquint::explorer::CheckError>>, mode: &str| match r {
+            Ok(inquint::explorer::CheckOutcome::Pass { states, max_depth }) => (states, max_depth),
+            Ok(inquint::explorer::CheckOutcome::InvariantViolation { .. }) => {
                 panic!("{fixture} ({mode}): unexpected violation")
             }
-            Ok(quintck::explorer::CheckOutcome::Deadlock { .. }) => {
+            Ok(inquint::explorer::CheckOutcome::Deadlock { .. }) => {
                 panic!("{fixture} ({mode}): unexpected deadlock")
             }
-            Ok(quintck::explorer::CheckOutcome::Incomplete { .. }) => {
+            Ok(inquint::explorer::CheckOutcome::Incomplete { .. }) => {
                 panic!("{fixture} ({mode}): unexpected incomplete")
             }
             Err(e) => panic!("{fixture} ({mode}): error {}", e.error),
         };
-        let (sa, da) = unpack(quintck::explorer::check(&spec, &seq), "seq");
-        let (sb, db) = unpack(quintck::explorer::check(&spec, &par), "par");
+        let (sa, da) = unpack(inquint::explorer::check(&spec, &seq), "seq");
+        let (sb, db) = unpack(inquint::explorer::check(&spec, &par), "par");
         assert_eq!(sa, sb, "{fixture}: state count differs");
         assert_eq!(da, db, "{fixture}: depth differs");
     }

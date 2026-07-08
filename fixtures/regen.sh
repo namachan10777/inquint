@@ -42,7 +42,7 @@ gen Raft.json specs/Raft.qnt --main=raft_3 \
 
 # Benchmark instances (module bench in each spec): much larger parameters,
 # sized so each takes on the order of a minute with the v1 checker. Only
-# checked by quintck (quintck-bench.sh) — too large for Apalache/TLC.
+# checked by inquint (scripts/inquint-bench.sh) — too large for Apalache/TLC.
 benchgen() { # benchgen <name> <invariants>
   local out="fixtures/bench_$1"
   echo "generating $out.json"
@@ -69,7 +69,7 @@ largegen DiningPhilosophers consistent
 largegen LamportMutex mutex,requestConsistency
 
 # Temporal-property fixtures: compiled with --temporal so the property defs
-# and their dependencies survive flattening. Used by quintck's native
+# and their dependencies survive flattening. Used by inquint's native
 # temporal checking (specs/check.sh checks the same properties with TLC).
 echo "generating temporal fixtures"
 quint compile --target=json specs/TwoLayeredCache.qnt --main=main \
@@ -95,7 +95,7 @@ quint compile --target=json specs/Raft.qnt --main=raft_election \
   --temporal=termsMonotone,quorumCandidateProgress,brokenEventuallyLeaderNoFairness \
   > fixtures/Raft_election.json
 
-# Detection-lab specs with known lasso shapes (quintck-only).
+# Detection-lab specs with known lasso shapes (inquint-only).
 quint compile --target=json specs/TemporalLab.qnt --main=stutter_lab \
   --temporal=brokenReach,fairReach > fixtures/TemporalLab_stutter.json
 quint compile --target=json specs/TemporalLab.qnt --main=cycle_lab \

@@ -56,10 +56,10 @@ def median_runs(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def spec_order(df: pl.DataFrame) -> list[str]:
-    """Specs sorted by parallel quintck wall time (fast → slow)."""
-    max_t = df.filter(pl.col("backend") == "quintck")["threads"].max()
+    """Specs sorted by parallel inquint wall time (fast → slow)."""
+    max_t = df.filter(pl.col("backend") == "inquint")["threads"].max()
     base = (
-        df.filter((pl.col("backend") == "quintck") & (pl.col("threads") == max_t))
+        df.filter((pl.col("backend") == "inquint") & (pl.col("threads") == max_t))
         .sort("wall_s")
     )
     return base["spec"].to_list()
@@ -82,7 +82,7 @@ def bar_label(ax, y, x, text):
 
 def plot_wall(df: pl.DataFrame, out: Path):
     specs = spec_order(df)
-    max_t = int(df.filter(pl.col("backend") == "quintck")["threads"].max())
+    max_t = int(df.filter(pl.col("backend") == "inquint")["threads"].max())
     # timed-out bars are drawn at the timeout budget (hatched)
     timeout_s = float(
         df.filter(~pl.col("timed_out"))["wall_s"].max() or 600.0
@@ -94,8 +94,8 @@ def plot_wall(df: pl.DataFrame, out: Path):
     seen_labels: set[str] = set()
     for i, spec in enumerate(specs):
         for dy, backend, threads, color, label in [
-            (1.5 * h, "quintck", 1, QK_1T, "quintck (1 thread)"),
-            (0.5 * h, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
+            (1.5 * h, "inquint", 1, QK_1T, "inquint (1 thread)"),
+            (0.5 * h, "inquint", max_t, QK_NT, f"inquint ({max_t} threads)"),
             (-0.5 * h, "tlc", None, TLC_C, "TLC (all cores)"),
             (-1.5 * h, "apalache", None, APA_C, "apalache (bounded symbolic)"),
         ]:
@@ -115,7 +115,7 @@ def plot_wall(df: pl.DataFrame, out: Path):
     ax.set_xscale("log")
     ax.set_xlabel("wall time (s, log scale)")
     has_apalache = not df.filter(pl.col("backend") == "apalache").is_empty()
-    title = "Invariant checking wall time — quintck vs TLC"
+    title = "Invariant checking wall time — inquint vs TLC"
     note = "hatched = timeout (bar drawn at the budget)"
     if has_apalache:
         title += " vs apalache"
@@ -129,7 +129,7 @@ def plot_wall(df: pl.DataFrame, out: Path):
 
 
 def plot_scaling(df: pl.DataFrame, out: Path):
-    qk = df.filter((pl.col("backend") == "quintck") & ~pl.col("timed_out"))
+    qk = df.filter((pl.col("backend") == "inquint") & ~pl.col("timed_out"))
     threads = sorted(qk["threads"].unique().to_list())
     fig, ax = plt.subplots(figsize=(7, 5))
     for spec in spec_order(df):
@@ -145,7 +145,7 @@ def plot_scaling(df: pl.DataFrame, out: Path):
     ax.plot(threads, threads, "--", color="gray", linewidth=1, label="ideal")
     ax.set_xlabel("threads")
     ax.set_ylabel("speedup vs 1 thread")
-    ax.set_title("quintck parallel scaling")
+    ax.set_title("inquint parallel scaling")
     ax.set_xticks(threads)
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
@@ -156,13 +156,13 @@ def plot_scaling(df: pl.DataFrame, out: Path):
 
 def plot_memory(df: pl.DataFrame, out: Path):
     specs = spec_order(df)
-    max_t = int(df.filter(pl.col("backend") == "quintck")["threads"].max())
+    max_t = int(df.filter(pl.col("backend") == "inquint")["threads"].max())
     fig, ax = plt.subplots(figsize=(9, 0.5 * len(specs) + 1.5))
     h = 0.27
     seen_labels: set[str] = set()
     for i, spec in enumerate(specs):
         for dy, backend, threads, color, label in [
-            (h, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
+            (h, "inquint", max_t, QK_NT, f"inquint ({max_t} threads)"),
             (0, "tlc", None, TLC_C, "TLC"),
             (-h, "apalache", None, APA_C, "apalache"),
         ]:
@@ -186,13 +186,13 @@ def plot_memory(df: pl.DataFrame, out: Path):
 
 def plot_throughput(df: pl.DataFrame, out: Path):
     specs = spec_order(df)
-    max_t = int(df.filter(pl.col("backend") == "quintck")["threads"].max())
+    max_t = int(df.filter(pl.col("backend") == "inquint")["threads"].max())
     fig, ax = plt.subplots(figsize=(9, 0.5 * len(specs) + 1.5))
     h = 0.27
     seen_labels: set[str] = set()
     for i, spec in enumerate(specs):
         for dy, backend, threads, color, label in [
-            (h, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
+            (h, "inquint", max_t, QK_NT, f"inquint ({max_t} threads)"),
             (0, "tlc", None, TLC_C, "TLC"),
             (-h, "apalache", None, APA_C, "apalache"),
         ]:

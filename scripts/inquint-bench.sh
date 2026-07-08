@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Benchmark suite: one heavyweight check per spec, each sized to take on
 # the order of a minute with the v1 (unoptimized) checker. Use this to
-# measure optimization work; correctness is gated by quintck-check.sh.
+# measure optimization work; correctness is gated by scripts/inquint-check.sh.
 #
-#   bash quintck-bench.sh [--only <Spec>]
+#   bash scripts/inquint-bench.sh [--only <Spec>]
 #
 # The bench instances live in each spec's `module bench` and are compiled
 # into fixtures/bench_*.json by fixtures/regen.sh. They are NOT verified by
 # Apalache/TLC (specs/check.sh) — far too large for those backends.
 set -u -o pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 ONLY=""
 if [[ "${1:-}" == "--only" ]]; then
@@ -19,7 +19,7 @@ fi
 
 echo "== building (release) =="
 cargo build -q --release || exit 1
-Q=target/release/quintck
+Q=target/release/inquint
 
 # spec|args   (all expected to pass; timing is the point)
 BENCHES=$(cat <<'EOF'

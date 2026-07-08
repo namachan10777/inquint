@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Runs quintck over the specs corpus fixtures and asserts the expected
+# Runs inquint over the specs corpus fixtures and asserts the expected
 # outcome of every check — the invariant/deadlock subset of specs/check.sh,
 # checked natively (no Apalache/TLC).
 #
-#   bash quintck-check.sh [--only <Spec>]
+#   bash scripts/inquint-check.sh [--only <Spec>]
 #
 # pass      => exit 0
 # violation => exit 1 AND output contains "[violation]" at the documented depth
 set -u
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 ONLY=""
 if [[ "${1:-}" == "--only" ]]; then
@@ -18,7 +18,7 @@ fi
 
 echo "== building =="
 cargo build -q --release || exit 1
-Q=target/release/quintck
+Q=target/release/inquint
 
 # expected|spec|depth(empty for pass)|args...
 CHECKS=$(cat <<'EOF'

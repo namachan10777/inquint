@@ -79,7 +79,7 @@ pub fn trace_to_itf(
                 "https://apalache-mc.org/docs/adr/015adr-trace.html".to_string(),
             ),
             source: Some(source.to_string()),
-            description: Some("Created by quintck".to_string()),
+            description: Some("Created by inquint".to_string()),
             var_types: BTreeMap::default(),
             timestamp: None,
             other,
