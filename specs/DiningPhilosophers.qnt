@@ -149,7 +149,7 @@ module dining_naive {
 
 // Larger instance for benchmarking explicit-state checkers.
 module bench {
-  import dining(N = 14, fixLast = true).*
+  import dining(N = 13, fixLast = true).*
 }
 
 // Very large instance: 96-entry maps, for persistent-container

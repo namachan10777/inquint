@@ -175,7 +175,7 @@ module paxos {
 module main {
   import paxos(
     Acceptors = Set("a1", "a2", "a3"),
-    Values = Set(1, 2),
+    Values = Set(1, 2, 3, 4),
     Quorums = Set(Set("a1", "a2"), Set("a1", "a3"), Set("a2", "a3")),
     MaxBallot = 2
   ).*
@@ -185,8 +185,8 @@ module main {
 module bench {
   import paxos(
     Acceptors = Set("a1", "a2", "a3"),
-    Values = Set(1, 2),
+    Values = Set(1, 2, 3, 4),
     Quorums = Set(Set("a1", "a2"), Set("a1", "a3"), Set("a2", "a3")),
-    MaxBallot = 4
+    MaxBallot = 2
   ).*
 }

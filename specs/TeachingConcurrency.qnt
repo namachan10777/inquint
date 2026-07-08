@@ -119,5 +119,5 @@ module main {
 // Larger instance for benchmarking explicit-state checkers (not used by
 // the Apalache/TLC checks in specs/check.sh).
 module bench {
-  import teaching_concurrency(N = 9).*
+  import teaching_concurrency(N = 8).*
 }

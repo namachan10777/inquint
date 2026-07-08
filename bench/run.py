@@ -38,18 +38,20 @@ class Spec:
 
 
 # Mirrors quintck-bench.sh (args) and fixtures/regen.sh (invariants).
-# Sized so quintck (all cores) takes ~20-35s per spec.
+# Every instance is finite and fully explored (--exhaustive): quintck and
+# TLC do identical work. bound_steps records the measured diameter, used
+# as apalache's depth bound. Sized so quintck (all cores) takes ~15-80s.
 SPECS = [
-    Spec("TeachingConcurrency", ["--max-steps", "6"], False, "correctness", 6),
+    Spec("TeachingConcurrency", ["--exhaustive"], True, "correctness", 16),
     Spec("ClockSync", ["--exhaustive"], True, "skewOK", 73),
-    Spec("TwoPhaseCommit", ["--max-steps", "18"], False, "consistency", 18),
-    Spec("ReadersWriters", ["--max-steps", "8"], False, "safety", 8),
+    Spec("TwoPhaseCommit", ["--exhaustive"], True, "consistency", 28),
+    Spec("ReadersWriters", ["--exhaustive"], True, "safety", 16),
     Spec("TwoLayeredCache", ["--exhaustive"], True, "cleanConsistency,dirtyInL1", 124),
-    Spec("DiningPhilosophers", ["--max-steps", "14"], False, "consistent", 14),
+    Spec("DiningPhilosophers", ["--exhaustive"], True, "consistent", 26),
     Spec("ReliableBroadcast", ["--exhaustive"], True, "validity,relayedBeforeDelivered", 13),
-    Spec("LamportMutex", ["--max-steps", "11"], False, "mutex,requestConsistency", 11),
-    Spec("Paxos", ["--max-steps", "13"], False, "agreement,oneValuePerBallot", 13),
-    Spec("Raft", ["--max-steps", "21"], False, "electionSafety,logMatching,voteIntegrity", 21),
+    Spec("LamportMutex", ["--exhaustive"], True, "mutex,requestConsistency", 64),
+    Spec("Paxos", ["--exhaustive"], True, "agreement,oneValuePerBallot", 24),
+    Spec("Raft", ["--exhaustive"], True, "electionSafety,logMatching,voteIntegrity", 27),
 ]
 
 TIME_RE = re.compile(

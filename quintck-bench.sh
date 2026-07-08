@@ -23,16 +23,16 @@ Q=target/release/quintck
 
 # spec|args   (all expected to pass; timing is the point)
 BENCHES=$(cat <<'EOF'
-TeachingConcurrency|fixtures/bench_TeachingConcurrency.json --max-steps 6
+TeachingConcurrency|fixtures/bench_TeachingConcurrency.json --exhaustive
 ClockSync|fixtures/bench_ClockSync.json --exhaustive
-TwoPhaseCommit|fixtures/bench_TwoPhaseCommit.json --max-steps 18
-ReadersWriters|fixtures/bench_ReadersWriters.json --max-steps 8
+TwoPhaseCommit|fixtures/bench_TwoPhaseCommit.json --exhaustive
+ReadersWriters|fixtures/bench_ReadersWriters.json --exhaustive
 TwoLayeredCache|fixtures/bench_TwoLayeredCache.json --exhaustive
-DiningPhilosophers|fixtures/bench_DiningPhilosophers.json --max-steps 14
+DiningPhilosophers|fixtures/bench_DiningPhilosophers.json --exhaustive
 ReliableBroadcast|fixtures/bench_ReliableBroadcast.json --exhaustive
-LamportMutex|fixtures/bench_LamportMutex.json --max-steps 11
-Paxos|fixtures/bench_Paxos.json --max-steps 13
-Raft|fixtures/bench_Raft.json --max-steps 21
+LamportMutex|fixtures/bench_LamportMutex.json --exhaustive
+Paxos|fixtures/bench_Paxos.json --exhaustive
+Raft|fixtures/bench_Raft.json --exhaustive
 EOF
 )
 
