@@ -185,8 +185,16 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
             Ok(Value::record_shaped(shape, out.as_slice()))
         },
         "powerset" => |_, args| Ok(Value::power_set(args[0])),
-        "contains" => |_, args| Ok(Value::bool(args[0].contains(args[1].normalize()?)?)),
-        "in" => |_, args| Ok(Value::bool(args[1].contains(args[0].normalize()?)?)),
+        "contains" => |_, args| {
+            let e = args[1].normalize()?;
+            crate::value::probe_log_read(args[0], e);
+            Ok(Value::bool(args[0].contains(e)?))
+        },
+        "in" => |_, args| {
+            let e = args[0].normalize()?;
+            crate::value::probe_log_read(args[1], e);
+            Ok(Value::bool(args[1].contains(e)?))
+        },
         "subseteq" => |_, args| Ok(Value::bool(args[0].subseteq(args[1])?)),
         "exclude" => |_, args| {
             let a = args[0].enumerate()?;
@@ -202,6 +210,10 @@ pub fn eager_op(op: &str) -> Option<EagerFn> {
         "union" => |_, args| {
             let a = args[0].enumerate()?;
             let b = args[1].enumerate()?;
+            // singleton union = element-granularity write (POR probe)
+            if b.len() == 1 {
+                crate::value::probe_log_write(args[0], b[0]);
+            }
             Ok(Value::set_sorted(merge_sorted(&a, &b)))
         },
         "intersect" => |_, args| {

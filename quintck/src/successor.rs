@@ -99,6 +99,77 @@ fn enumerate_partial_inner(
     Ok(SubActionRuns { partials })
 }
 
+/// A run's dynamic access footprint (POR probe).
+pub struct RunFootprint {
+    /// Var-granularity read/write bitsets.
+    pub reads: u64,
+    pub writes: u64,
+    /// Element accesses: (container value id, element id, is_write).
+    pub elems: Vec<crate::value::ProbeElem>,
+}
+
+/// Like [`enumerate`] but records each successful run's footprint
+/// (deduplicated per successor by merging). Sequential probe use only.
+pub fn enumerate_probe(
+    vm: &mut Vm,
+    action: FnId,
+    from: Option<&[Value]>,
+) -> Result<Vec<(State, RunFootprint)>, QuintError> {
+    match from {
+        Some(state) => vm.load(state),
+        None => vm.clear_current(),
+    }
+
+    let mut ctl = ChoiceCtl::new();
+    let mut out: Vec<(State, RunFootprint)> = Vec::new();
+    let mut runs: u64 = 0;
+
+    loop {
+        runs += 1;
+        if runs > MAX_RUNS_PER_STATE {
+            return Err(QuintError::new(
+                "QNT501",
+                format!("more than {MAX_RUNS_PER_STATE} choice combinations in a single transition"),
+            ));
+        }
+        vm.reset_next();
+        vm.probe_vars = Some((0, 0, 0));
+        crate::value::probe_begin();
+        let mut env = Env::new(Some(&mut ctl));
+        let enabled = vm.run(&mut env, action)?;
+        let (mut reads, writes, frames) = vm.probe_vars.take().unwrap();
+        // optimistic: reads of frame-copied vars are treated as pure
+        // copies (the copy commutes with writers); over-optimistic when
+        // the var is ALSO genuinely read — acceptable for an upper bound
+        reads &= !(frames & !writes);
+        let elems = crate::value::probe_take();
+        if enabled.as_bool() {
+            let succ = vm.take_next_state()?;
+            match out.iter_mut().find(|(s, _)| *s == succ) {
+                Some((_, fp)) => {
+                    // several runs reach the same successor: merge
+                    fp.reads |= reads;
+                    fp.writes |= writes;
+                    fp.elems.extend_from_slice(&elems);
+                }
+                None => out.push((
+                    succ,
+                    RunFootprint {
+                        reads,
+                        writes,
+                        elems,
+                    },
+                )),
+            }
+        }
+        if !ctl.advance() {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Enumerate all distinct successor states of `from` under `action`
 /// (or all initial states when `from` is `None`). The result is sorted
 /// (by id) and deduplicated.

@@ -107,6 +107,168 @@ fn check_invs(
 }
 
 // ---------------------------------------------------------------------------
+// POR probe (measurement only, UNSOUND)
+// ---------------------------------------------------------------------------
+
+/// Optimistic partial-order-reduction probe: at every state, expand only
+/// the smallest conflict-closed cluster of transitions (dynamic
+/// footprints, ample conditions C2/C3 ignored). The state count is an
+/// UPPER BOUND on what sound POR could achieve — the verdict is not
+/// trustworthy. `elem_granularity` refines var-level conflicts by
+/// element accesses (map keys / set elements) attributed to state
+/// variables by container-value identity.
+pub fn por_probe(spec: &CompiledSpec, cfg: &CheckConfig, elem_granularity: bool) -> u64 {
+    use crate::successor::{enumerate_probe, RunFootprint};
+    use rustc_hash::FxHashMap;
+
+    fn conflicts(
+        a: &RunFootprint,
+        b: &RunFootprint,
+        attr: &FxHashMap<u32, u8>,
+        elem: bool,
+    ) -> bool {
+        let cross = (a.writes & (b.reads | b.writes)) | (b.writes & (a.reads | a.writes));
+        if cross == 0 {
+            return false;
+        }
+        if !elem {
+            return true;
+        }
+        // try to explain every conflicting variable at element granularity
+        let on_var = |fp: &RunFootprint, v: u8| -> Vec<(u32, bool)> {
+            fp.elems
+                .iter()
+                .filter(|(c, _, _)| attr.get(c) == Some(&v))
+                .map(|&(_, k, w)| (k, w))
+                .collect()
+        };
+        for v in 0..64u8 {
+            if cross & (1 << v) == 0 {
+                continue;
+            }
+            let (ea, eb) = (on_var(a, v), on_var(b, v));
+            if ea.is_empty() || eb.is_empty() {
+                return true; // whole-variable access
+            }
+            for &(ka, wa) in &ea {
+                for &(kb, wb) in &eb {
+                    if ka == kb && (wa || wb) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    let mut vm = spec.make_vm();
+    let mut fps = FpSet::default();
+    let mut frontier = FlatFrontier::new(spec.vars.len());
+    let mut states: u64 = 0;
+
+    let initial = enumerate(&mut vm, spec.init, None).expect("probe: init failed");
+    for state in initial {
+        if fps.insert(FpSet::fingerprint(&state)) {
+            states += 1;
+            frontier.push(&state, 0);
+        }
+    }
+
+    let mut buf: Vec<Value> = Vec::new();
+    let mut last_report = std::time::Instant::now();
+    let (mut stat_states, mut stat_trans, mut stat_ample, mut stat_reduced) =
+        (0u64, 0u64, 0u64, 0u64);
+    while let Some((_, depth)) = frontier.pop(&mut buf) {
+        if cfg.max_states.is_some_and(|max| states >= max) {
+            break;
+        }
+        if cfg.max_steps.is_some_and(|max| depth >= max) {
+            continue;
+        }
+        let succs = enumerate_probe(&mut vm, spec.step, Some(&buf)).expect("probe: step failed");
+        if succs.is_empty() {
+            continue;
+        }
+        // container value -> variable index (ambiguous values dropped =
+        // conservative whole-variable treatment)
+        let mut attr: FxHashMap<u32, u8> = FxHashMap::default();
+        let mut dup: Vec<u32> = Vec::new();
+        for (i, v) in buf.iter().enumerate() {
+            if attr.insert(v.to_bits(), i as u8).is_some() {
+                dup.push(v.to_bits());
+            }
+        }
+        for d in dup {
+            attr.remove(&d);
+        }
+
+        // union-find over transitions by conflict
+        let n = succs.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut Vec<usize>, i: usize) -> usize {
+            if p[i] != i {
+                let r = find(p, p[i]);
+                p[i] = r;
+            }
+            p[i]
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                if conflicts(&succs[i].1, &succs[j].1, &attr, elem_granularity) {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+        let mut comp_size: FxHashMap<usize, usize> = FxHashMap::default();
+        for i in 0..n {
+            *comp_size.entry(find(&mut parent, i)).or_insert(0) += 1;
+        }
+        let best = *comp_size
+            .iter()
+            .min_by_key(|(_, &sz)| sz)
+            .map(|(root, _)| root)
+            .unwrap();
+        stat_states += 1;
+        stat_trans += n as u64;
+
+        // C3 approximation (queue proviso): the ample cluster must
+        // discover at least one fresh state, else expand fully — without
+        // this, deferral chains collapse the exploration to single paths.
+        let ample_fresh = succs.iter().enumerate().any(|(i, (succ, _))| {
+            find(&mut parent, i) == best && !fps.contains(FpSet::fingerprint(succ))
+        });
+        let expand_all = comp_size[&best] == n || !ample_fresh;
+        stat_ample += if expand_all { n as u64 } else { comp_size[&best] as u64 };
+        if !expand_all {
+            stat_reduced += 1;
+        }
+        for (i, (succ, _)) in succs.iter().enumerate() {
+            if !expand_all && find(&mut parent, i) != best {
+                continue; // pruned (optimistically)
+            }
+            if fps.insert(FpSet::fingerprint(succ)) {
+                states += 1;
+                frontier.push(succ, depth + 1);
+            }
+        }
+        if last_report.elapsed().as_secs() >= 2 {
+            eprintln!("  probe: {states} states, depth {depth}");
+            last_report = std::time::Instant::now();
+        }
+    }
+    eprintln!(
+        "  probe stats: {stat_states} expansions, avg transitions {:.1}, avg ample {:.1}, reduced at {:.1}% of states",
+        stat_trans as f64 / stat_states.max(1) as f64,
+        stat_ample as f64 / stat_states.max(1) as f64,
+        stat_reduced as f64 / stat_states.max(1) as f64 * 100.0,
+    );
+    states
+}
+
+// ---------------------------------------------------------------------------
 // Fingerprint mode
 // ---------------------------------------------------------------------------
 

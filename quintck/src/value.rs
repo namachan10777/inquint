@@ -571,6 +571,60 @@ fn value_cmp_in(s: &ValueStore, a: Value, b: Value) -> Ordering {
 }
 
 // ---------------------------------------------------------------------------
+// POR probe: element-granularity access log (--por-probe measurement)
+// ---------------------------------------------------------------------------
+
+/// One recorded element access: (container value id, element/key id,
+/// is_write). Containers are identified by value id; the prober attributes
+/// them to state variables by matching the source state's values.
+pub type ProbeElem = (u32, u32, bool);
+
+thread_local! {
+    static PROBE_LOG: RefCell<Option<Vec<ProbeElem>>> = const { RefCell::new(None) };
+}
+
+/// Fast guard for the hot-path hooks: one relaxed load when probing is
+/// off (the probe itself is single-threaded, so a global flag is fine).
+/// Cache-line aligned: the neighbouring statics (the store's length
+/// counter) are written constantly, and sharing their line would ping
+/// this read-only flag across every core.
+#[repr(align(128))]
+struct PaddedFlag(AtomicU32);
+static PROBE_ON: PaddedFlag = PaddedFlag(AtomicU32::new(0));
+
+pub fn probe_begin() {
+    PROBE_ON.0.store(1, AtomicOrdering::Relaxed);
+    PROBE_LOG.with_borrow_mut(|l| *l = Some(Vec::new()));
+}
+
+pub fn probe_take() -> Vec<ProbeElem> {
+    PROBE_ON.0.store(0, AtomicOrdering::Relaxed);
+    PROBE_LOG.with_borrow_mut(|l| l.take().unwrap_or_default())
+}
+
+#[inline]
+fn probe_log(container: Value, elem: Value, write: bool) {
+    if PROBE_ON.0.load(AtomicOrdering::Relaxed) == 0 {
+        return;
+    }
+    PROBE_LOG.with_borrow_mut(|l| {
+        if let Some(log) = l {
+            log.push((container.to_bits(), elem.to_bits(), write));
+        }
+    })
+}
+
+/// Log a `contains`-style element read (public: called from builtins).
+pub fn probe_log_read(container: Value, elem: Value) {
+    probe_log(container, elem, false);
+}
+
+/// Log a singleton-union-style element write.
+pub fn probe_log_write(container: Value, elem: Value) {
+    probe_log(container, elem, true);
+}
+
+// ---------------------------------------------------------------------------
 // Map update memo
 // ---------------------------------------------------------------------------
 
@@ -618,6 +672,7 @@ pub fn map_update_cached(
     val: Value,
     must_exist: bool,
 ) -> EvalResult {
+    probe_log(map, key, true);
     let slot = update_slot(map, key, val, must_exist);
     let hit = UPDATE_CACHE.with_borrow(|c| {
         let e = &c[slot];
@@ -1290,6 +1345,7 @@ impl Value {
 
     /// Map lookup by (normalized) key: id scan / binary search.
     pub fn map_get(self, key: Value) -> Option<Value> {
+        probe_log(self, key, false);
         let entries = self.as_map();
         map_find_by_id(entries, key).map(|i| entries[i].1)
     }

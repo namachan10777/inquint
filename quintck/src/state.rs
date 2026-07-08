@@ -94,6 +94,10 @@ impl FpSet {
         foldhash::fast::FixedState::with_seed(FP_SEED).hash_one(s)
     }
 
+    pub fn contains(&self, fp: u64) -> bool {
+        self.table.find(fp, |&e| e == fp).is_some()
+    }
+
     /// Insert a fingerprint; returns true if it was fresh. The fingerprint
     /// is its own hash (already uniform).
     pub fn insert(&mut self, fp: u64) -> bool {

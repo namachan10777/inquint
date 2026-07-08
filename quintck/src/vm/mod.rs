@@ -224,6 +224,11 @@ pub struct Vm<'p> {
     next_stack: Vec<bool>,
     /// Retired snapshot buffers, reused by SnapNext/AnyBegin.
     snap_pool: Vec<Vec<Option<Value>>>,
+    /// POR probe: when set, LoadVar/Assign record var-granularity
+    /// (reads, changed-writes, frame-copies) bitsets here. A frame copy
+    /// is an assign of the unchanged current value (`x' = x`) — invisible
+    /// for commutation purposes.
+    pub probe_vars: Option<(u64, u64, u64)>,
 }
 
 /// Callee parameter counts are bounded so call frames can save the old
@@ -263,6 +268,7 @@ impl<'p> Vm<'p> {
             any_stack: Vec::new(),
             next_stack: Vec::new(),
             snap_pool: Vec::new(),
+            probe_vars: None,
         }
     }
 
@@ -598,6 +604,9 @@ impl<'p> Vm<'p> {
                 }
                 Op::Move => reg!(ins.a) = reg!(ins.b),
                 Op::LoadVar => {
+                    if let Some((r, _, _)) = &mut self.probe_vars {
+                        *r |= 1 << ins.b;
+                    }
                     let bank = if env.next_mode {
                         &self.vars_next
                     } else {
@@ -619,6 +628,13 @@ impl<'p> Vm<'p> {
                 }
                 Op::Assign => {
                     let value = try_at!(pc, reg!(ins.c).normalize());
+                    if let Some((_, w, fr)) = &mut self.probe_vars {
+                        if self.vars_cur[ins.b as usize] == Some(value) {
+                            *fr |= 1 << ins.b;
+                        } else {
+                            *w |= 1 << ins.b;
+                        }
+                    }
                     self.vars_next[ins.b as usize] = Some(value);
                     reg!(ins.a) = Value::bool(true);
                 }

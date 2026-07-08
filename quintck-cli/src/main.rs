@@ -61,6 +61,12 @@ struct Cli {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// UNSOUND measurement mode: explore with an optimistic
+    /// partial-order reduction and print the reduced state count
+    /// (granularity: "var" or "elem"). Verdicts are not trustworthy.
+    #[arg(long, value_name = "GRANULARITY")]
+    por_probe: Option<String>,
+
     /// Write the counterexample trace in ITF format to this file
     #[arg(long)]
     out_itf: Option<PathBuf>,
@@ -156,6 +162,20 @@ fn main() -> ExitCode {
         exact_states: cli.exact_states,
         threads: cli.threads.unwrap_or_else(|| CheckConfig::default().threads),
     };
+
+    if let Some(gran) = &cli.por_probe {
+        let elem = match gran.as_str() {
+            "elem" => true,
+            "var" => false,
+            other => {
+                eprintln!("--por-probe must be 'var' or 'elem', got {other}");
+                return ExitCode::from(2);
+            }
+        };
+        let states = quintck::explorer::por_probe(&spec, &cfg, elem);
+        println!("[probe:{gran}] {states} states explored (UNSOUND upper-bound probe)");
+        return ExitCode::SUCCESS;
+    }
 
     let source = cli.input.display().to_string();
     let write_itf = |trace: &[quintck::state::State], violation: bool| {
