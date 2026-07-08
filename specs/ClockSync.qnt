@@ -102,5 +102,5 @@ module main {
 
 // Larger instance for benchmarking explicit-state checkers.
 module bench {
-  import clock_sync(N = 6, MaxSkew = 5, MaxClock = 40).*
+  import clock_sync(N = 7, MaxSkew = 5, MaxClock = 40).*
 }

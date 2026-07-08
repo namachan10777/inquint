@@ -29,22 +29,27 @@ ROOT = Path(__file__).resolve().parent.parent
 class Spec:
     name: str
     quintck_args: list[str]  # after the fixture path
-    exhaustive: bool  # True → TLC runs the same (unbounded) search
-    invariants: str  # TLC --invariant argument
+    exhaustive: bool  # True → TLC runs the same (complete) search
+    invariants: str  # quint verify --invariant argument
+    # depth bound handed to apalache (= quintck's --max-steps for capped
+    # specs, the measured diameter for exhaustive ones). Apalache is a
+    # bounded symbolic checker, so this is "verify up to depth K".
+    bound_steps: int
 
 
 # Mirrors quintck-bench.sh (args) and fixtures/regen.sh (invariants).
+# Sized so quintck (all cores) takes ~20-35s per spec.
 SPECS = [
-    Spec("TeachingConcurrency", ["--max-steps", "6"], False, "correctness"),
-    Spec("ClockSync", ["--exhaustive"], True, "skewOK"),
-    Spec("TwoPhaseCommit", ["--max-steps", "18"], False, "consistency"),
-    Spec("ReadersWriters", ["--exhaustive"], True, "safety"),
-    Spec("TwoLayeredCache", ["--exhaustive"], True, "cleanConsistency,dirtyInL1"),
-    Spec("DiningPhilosophers", ["--max-steps", "16"], False, "consistent"),
-    Spec("ReliableBroadcast", ["--exhaustive"], True, "validity,relayedBeforeDelivered"),
-    Spec("LamportMutex", ["--max-steps", "15"], False, "mutex,requestConsistency"),
-    Spec("Paxos", ["--max-steps", "11"], False, "agreement,oneValuePerBallot"),
-    Spec("Raft", ["--max-steps", "15"], False, "electionSafety,logMatching,voteIntegrity"),
+    Spec("TeachingConcurrency", ["--max-steps", "6"], False, "correctness", 6),
+    Spec("ClockSync", ["--exhaustive"], True, "skewOK", 73),
+    Spec("TwoPhaseCommit", ["--max-steps", "18"], False, "consistency", 18),
+    Spec("ReadersWriters", ["--max-steps", "8"], False, "safety", 8),
+    Spec("TwoLayeredCache", ["--exhaustive"], True, "cleanConsistency,dirtyInL1", 124),
+    Spec("DiningPhilosophers", ["--max-steps", "14"], False, "consistent", 14),
+    Spec("ReliableBroadcast", ["--exhaustive"], True, "validity,relayedBeforeDelivered", 13),
+    Spec("LamportMutex", ["--max-steps", "11"], False, "mutex,requestConsistency", 11),
+    Spec("Paxos", ["--max-steps", "13"], False, "agreement,oneValuePerBallot", 13),
+    Spec("Raft", ["--max-steps", "21"], False, "electionSafety,logMatching,voteIntegrity", 21),
 ]
 
 TIME_RE = re.compile(
@@ -64,6 +69,9 @@ def run_timed(cmd: list[str], timeout: float) -> dict | None:
             full, capture_output=True, text=True, timeout=timeout, cwd=ROOT
         )
     except subprocess.TimeoutExpired:
+        # quint verify spawns a JVM (apalache server / TLC); make sure the
+        # tree dies with the timeout
+        subprocess.run(["pkill", "-f", "apalache|tla2tools"], capture_output=True)
         return None
     out = proc.stdout + proc.stderr
     m = TIME_RE.search(out)
@@ -95,6 +103,7 @@ def base_row(spec: Spec, backend: str, threads: int, rep: int, commit: str) -> d
         "tlc_reported_s": None,
         "verdict": "error",
         "exhaustive": spec.exhaustive,
+        "bound_steps": None,
     }
 
 
@@ -107,6 +116,8 @@ def bench_quintck(spec: Spec, threads: int, rep: int, commit: str, timeout: floa
         "--threads",
         str(threads),
     ]
+    if not spec.exhaustive:
+        row["bound_steps"] = spec.bound_steps
     r = run_timed(cmd, timeout)
     if r is None:
         row["verdict"] = "timeout"
@@ -115,6 +126,35 @@ def bench_quintck(spec: Spec, threads: int, rep: int, commit: str, timeout: floa
     if m := QK_STATES_RE.search(r["output"]):
         row["states"] = int(m.group(1))
         row["states_distinct"] = int(m.group(1))
+        row["verdict"] = "ok"
+    return row
+
+
+APALACHE_OK_RE = re.compile(r"No violation found \((\d+)ms\)")
+
+
+def bench_apalache(spec: Spec, rep: int, commit: str, timeout: float) -> dict:
+    """Bounded symbolic checking up to spec.bound_steps — a different kind
+    of work than explicit-state search, compared as "verify the invariant
+    up to depth K"."""
+    row = base_row(spec, "apalache", 1, rep, commit)
+    row["bound_steps"] = spec.bound_steps
+    cmd = [
+        "quint",
+        "verify",
+        str(ROOT / f"specs/{spec.name}.qnt"),
+        "--main=bench",
+        f"--invariant={spec.invariants}",
+        "--backend=apalache",
+        f"--max-steps={spec.bound_steps}",
+    ]
+    r = run_timed(cmd, timeout)
+    if r is None:
+        row["verdict"] = "timeout"
+        return row
+    row.update({k: r[k] for k in ("wall_s", "user_s", "sys_s", "max_rss_mb")})
+    if m := APALACHE_OK_RE.search(r["output"]):
+        row["tlc_reported_s"] = int(m.group(1)) / 1000
         row["verdict"] = "ok"
     return row
 
@@ -155,6 +195,7 @@ def main() -> int:
         help="comma-separated quintck thread counts",
     )
     ap.add_argument("--skip-tlc", action="store_true")
+    ap.add_argument("--skip-apalache", action="store_true")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--specs", default=None, help="comma-separated subset")
     ap.add_argument("--out", type=Path, default=ROOT / "bench/results.parquet")
@@ -194,9 +235,14 @@ def main() -> int:
             for t in thread_counts:
                 record(bench_quintck(spec, t, rep, commit, args.timeout))
         if not args.skip_tlc:
+            # TLC explores the complete state space: an equal-work
+            # comparison for exhaustive specs; for capped specs it does
+            # strictly more work (recorded anyway, timeouts expected).
             for spec in specs:
-                if spec.exhaustive:
-                    record(bench_tlc(spec, rep, commit, args.timeout, ncpu))
+                record(bench_tlc(spec, rep, commit, args.timeout, ncpu))
+        if not args.skip_apalache:
+            for spec in specs:
+                record(bench_apalache(spec, rep, commit, args.timeout))
 
     df = pl.DataFrame(
         rows,
@@ -216,10 +262,11 @@ def main() -> int:
             "tlc_reported_s": pl.Float64,
             "verdict": pl.Utf8,
             "exhaustive": pl.Boolean,
+            "bound_steps": pl.Int32,
         },
     )
     if args.out.exists():
-        df = pl.concat([pl.read_parquet(args.out), df], how="vertical")
+        df = pl.concat([pl.read_parquet(args.out), df], how="diagonal")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(args.out)
     print(f"\n{len(rows)} runs appended -> {args.out} ({len(df)} rows total)")

@@ -26,13 +26,13 @@ BENCHES=$(cat <<'EOF'
 TeachingConcurrency|fixtures/bench_TeachingConcurrency.json --max-steps 6
 ClockSync|fixtures/bench_ClockSync.json --exhaustive
 TwoPhaseCommit|fixtures/bench_TwoPhaseCommit.json --max-steps 18
-ReadersWriters|fixtures/bench_ReadersWriters.json --exhaustive
+ReadersWriters|fixtures/bench_ReadersWriters.json --max-steps 8
 TwoLayeredCache|fixtures/bench_TwoLayeredCache.json --exhaustive
-DiningPhilosophers|fixtures/bench_DiningPhilosophers.json --max-steps 16
+DiningPhilosophers|fixtures/bench_DiningPhilosophers.json --max-steps 14
 ReliableBroadcast|fixtures/bench_ReliableBroadcast.json --exhaustive
-LamportMutex|fixtures/bench_LamportMutex.json --max-steps 15
-Paxos|fixtures/bench_Paxos.json --max-steps 11
-Raft|fixtures/bench_Raft.json --max-steps 15
+LamportMutex|fixtures/bench_LamportMutex.json --max-steps 11
+Paxos|fixtures/bench_Paxos.json --max-steps 13
+Raft|fixtures/bench_Raft.json --max-steps 21
 EOF
 )
 

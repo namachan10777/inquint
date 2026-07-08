@@ -208,7 +208,7 @@ module main {
 
 // Larger instance for benchmarking explicit-state checkers.
 module bench {
-  import lamport_mutex(N = 4, MaxClock = 3).*
+  import lamport_mutex(N = 5, MaxClock = 3).*
 }
 
 // Very large instance: wide clock/req maps, for persistent-container

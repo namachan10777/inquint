@@ -165,5 +165,5 @@ module main {
 
 // Larger instance for benchmarking explicit-state checkers.
 module bench {
-  import reliable_broadcast(N = 10, Faulty = Set(1, 2)).*
+  import reliable_broadcast(N = 11, Faulty = Set(1, 2)).*
 }

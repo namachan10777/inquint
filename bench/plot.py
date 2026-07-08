@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 QK_1T = "#93b7e4"
 QK_NT = "#1f5fbf"
 TLC_C = "#c96a3f"
+APA_C = "#5f9e6e"
 
 
 def load(path: Path, commit: str | None, use_all: bool) -> pl.DataFrame:
@@ -40,6 +41,8 @@ def load(path: Path, commit: str | None, use_all: bool) -> pl.DataFrame:
 
 def median_runs(df: pl.DataFrame) -> pl.DataFrame:
     """Median over reps per (spec, backend, threads); keeps counts/verdict."""
+    if "bound_steps" not in df.columns:
+        df = df.with_columns(pl.lit(None, dtype=pl.Int32).alias("bound_steps"))
     return df.group_by(["spec", "backend", "threads"]).agg(
         pl.col("wall_s").median(),
         pl.col("user_s").median(),
@@ -48,6 +51,7 @@ def median_runs(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("exhaustive").first(),
         # a timeout in any rep marks the cell
         (pl.col("verdict") == "timeout").any().alias("timed_out"),
+        pl.col("bound_steps").first(),
     )
 
 
@@ -79,23 +83,30 @@ def bar_label(ax, y, x, text):
 def plot_wall(df: pl.DataFrame, out: Path):
     specs = spec_order(df)
     max_t = int(df.filter(pl.col("backend") == "quintck")["threads"].max())
-    fig, ax = plt.subplots(figsize=(9, 0.62 * len(specs) + 1.5))
+    # timed-out bars are drawn at the timeout budget (hatched)
+    timeout_s = float(
+        df.filter(~pl.col("timed_out"))["wall_s"].max() or 600.0
+    )
+    timeout_s = max(timeout_s, 600.0)
+    fig, ax = plt.subplots(figsize=(9, 0.85 * len(specs) + 1.5))
     ys = range(len(specs))
-    h = 0.27
+    h = 0.19
     seen_labels: set[str] = set()
     for i, spec in enumerate(specs):
         for dy, backend, threads, color, label in [
-            (h, "quintck", 1, QK_1T, "quintck (1 thread)"),
-            (0, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
-            (-h, "tlc", None, TLC_C, "TLC (all cores)"),
+            (1.5 * h, "quintck", 1, QK_1T, "quintck (1 thread)"),
+            (0.5 * h, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
+            (-0.5 * h, "tlc", None, TLC_C, "TLC (all cores)"),
+            (-1.5 * h, "apalache", None, APA_C, "apalache (bounded symbolic)"),
         ]:
             r = get(df, spec, backend, threads)
             if r is None:
                 continue
             label = None if label in seen_labels else (seen_labels.add(label) or label)
             if r["timed_out"]:
-                ax.barh(i + dy, 0.01, height=h, color=color, label=label)
-                bar_label(ax, i + dy, 0.01, "T/O")
+                ax.barh(i + dy, timeout_s, height=h, color=color, label=label,
+                        alpha=0.35, hatch="//")
+                bar_label(ax, i + dy, timeout_s, "T/O")
                 continue
             ax.barh(i + dy, r["wall_s"], height=h, color=color, label=label)
             bar_label(ax, i + dy, r["wall_s"], f"{r['wall_s']:.1f}s")
@@ -103,8 +114,14 @@ def plot_wall(df: pl.DataFrame, out: Path):
     ax.invert_yaxis()
     ax.set_xscale("log")
     ax.set_xlabel("wall time (s, log scale)")
-    ax.set_title("Model checking wall time — quintck vs TLC (bench corpus)")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=8)
+    has_apalache = not df.filter(pl.col("backend") == "apalache").is_empty()
+    title = "Invariant checking wall time — quintck vs TLC"
+    note = "hatched = timeout (bar drawn at the budget)"
+    if has_apalache:
+        title += " vs apalache"
+        note = "apalache: bounded symbolic checking to the same depth; " + note
+    ax.set_title(f"{title}\n({note})", fontsize=11)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=4, fontsize=8)
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out / "wall_time.png", dpi=150)
@@ -141,12 +158,13 @@ def plot_memory(df: pl.DataFrame, out: Path):
     specs = spec_order(df)
     max_t = int(df.filter(pl.col("backend") == "quintck")["threads"].max())
     fig, ax = plt.subplots(figsize=(9, 0.5 * len(specs) + 1.5))
-    h = 0.38
+    h = 0.27
     seen_labels: set[str] = set()
     for i, spec in enumerate(specs):
         for dy, backend, threads, color, label in [
-            (h / 2, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
-            (-h / 2, "tlc", None, TLC_C, "TLC"),
+            (h, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
+            (0, "tlc", None, TLC_C, "TLC"),
+            (-h, "apalache", None, APA_C, "apalache"),
         ]:
             r = get(df, spec, backend, threads)
             if r is None or r["max_rss_mb"] is None or r["timed_out"]:
@@ -159,7 +177,7 @@ def plot_memory(df: pl.DataFrame, out: Path):
     ax.set_xscale("log")
     ax.set_xlabel("max RSS (MB, log scale)")
     ax.set_title("Peak memory")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=8)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=4, fontsize=8)
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out / "memory.png", dpi=150)
@@ -170,12 +188,13 @@ def plot_throughput(df: pl.DataFrame, out: Path):
     specs = spec_order(df)
     max_t = int(df.filter(pl.col("backend") == "quintck")["threads"].max())
     fig, ax = plt.subplots(figsize=(9, 0.5 * len(specs) + 1.5))
-    h = 0.38
+    h = 0.27
     seen_labels: set[str] = set()
     for i, spec in enumerate(specs):
         for dy, backend, threads, color, label in [
-            (h / 2, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
-            (-h / 2, "tlc", None, TLC_C, "TLC"),
+            (h, "quintck", max_t, QK_NT, f"quintck ({max_t} threads)"),
+            (0, "tlc", None, TLC_C, "TLC"),
+            (-h, "apalache", None, APA_C, "apalache"),
         ]:
             r = get(df, spec, backend, threads)
             if (
@@ -193,7 +212,7 @@ def plot_throughput(df: pl.DataFrame, out: Path):
     ax.invert_yaxis()
     ax.set_xlabel("distinct states / second (millions)")
     ax.set_title("Exploration throughput")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=8)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=4, fontsize=8)
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out / "throughput.png", dpi=150)

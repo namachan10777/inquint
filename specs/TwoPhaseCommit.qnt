@@ -194,5 +194,5 @@ module main {
 
 // Larger instance for benchmarking explicit-state checkers.
 module bench {
-  import two_phase_commit(RMs = Set("rm1", "rm2", "rm3", "rm4", "rm5", "rm6", "rm7", "rm8")).*
+  import two_phase_commit(RMs = Set("rm1", "rm2", "rm3", "rm4", "rm5", "rm6", "rm7", "rm8", "rm9")).*
 }

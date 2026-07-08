@@ -133,5 +133,5 @@ module main {
 
 // Larger instance for benchmarking explicit-state checkers.
 module bench {
-  import readers_writers(N = 7).*
+  import readers_writers(N = 8).*
 }
