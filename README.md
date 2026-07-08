@@ -22,41 +22,109 @@ state graph, and Tarjan SCC analysis. `weakFair`/`strongFair` premises
 side conditions, including strong-fairness refinement. Every extracted lasso
 is self-validated against the negated property in debug builds.
 
-## Usage
+## Getting started
 
 ```sh
-# Invariants, from a .qnt file (requires `quint` on PATH; compiled internally)
+cargo build --release            # binary at target/release/quintck
+export PATH="$PWD/target/release:$PATH"
+```
+
+Checking a `.qnt` file directly requires the `quint` CLI on PATH (quintck
+compiles it internally). Alternatively, pre-compile once and hand quintck
+the JSON — no `quint` needed at check time:
+
+```sh
+quint compile --target=json --main=main spec.qnt > spec.json
+quintck spec.json --invariant=myInvariant
+```
+
+## Usage
+
+### Checking invariants (the default mode)
+
+```sh
+# check `agreement` up to 8 steps from the initial states
 quintck specs/Paxos.qnt --main=main --invariant=agreement --max-steps=8
 
-# Temporal properties (exhaustive by construction)
+# explore the complete (finite) state space instead of a depth bound
+quintck specs/Paxos.qnt --main=main --invariant=agreement --exhaustive
+
+# several invariants at once
+quintck spec.qnt --invariant=safety,consistency
+```
+
+Exploration is breadth-first over every nondeterministic choice (`any`
+branches, `nondet ... oneOf` picks), so a reported counterexample is
+always a shortest one. Deadlocks (states with no successor) are reported
+by default; suppress with `--no-deadlock` for specs whose executions
+legitimately terminate.
+
+On success quintck prints the number of distinct states and the maximum
+depth; on a violation it prints the invariant name and the trace:
+
+```text
+State 0:
+  ...          # initial state of the trace
+State 1:
+  ...          # first step
+[violation] invariant 'agreement' violated at depth 1
+```
+
+### Temporal (LTL / liveness) properties
+
+```sh
 quintck specs/ReadersWriters.qnt --main=main --temporal=noStarvation
 quintck specs/TwoLayeredCache.qnt --main=main \
   --temporal=verMonotone,eventuallyClean --out-itf lasso.itf.json
-
-# From a pre-compiled JSON file
-quint compile --target=json --main=main --invariant=agreement spec.qnt > spec.json
-quintck spec.json --invariant=agreement --exhaustive
-
-# Named init/step (e.g. qualified instances)
-quintck specs/DiningPhilosophers.qnt --main=dining_naive \
-  --init=naive::init --step=naive::step --exhaustive --out-itf trace.itf.json
-
-# Run-test execution: every path through a run's nondeterminism must pass
-quintck specs/TwoPhaseCommit.qnt --main=main --test=happyPathTest,abortTest
 ```
 
-Exit codes: `0` = all properties hold, `1` = violation found (invariant,
-deadlock, or temporal; output contains `[violation]` and the trace/lasso),
-`2` = tool error / unsupported feature.
+Temporal checking always explores the full state space (a depth bound
+would be unsound; `--max-steps` is ignored with a warning). Liveness
+counterexamples are lassos — with `--out-itf` they carry `loop_index` in
+the ITF trace.
 
-Options: `--max-steps N` (default 10) / `--exhaustive` (temporal checking is
-always exhaustive), `--no-deadlock`, `--max-states N`, `--out-itf PATH`,
-`--temporal P1,P2`, `--test [T1,T2]`.
+### Run tests
 
-Known limits: `weakFair`/`strongFair` only as top-level premises; integers
-are i64; `allLists`, `Int`/`Nat` enumeration, and `apalache::generate` are
-rejected. Unbounded random-walk `run` tests (e.g. `20.reps(_ => step)`) can
-exceed the path-enumeration cap — use the model checker for those.
+```sh
+# execute `run` definitions; every path through their nondeterminism must pass
+quintck specs/TwoPhaseCommit.qnt --main=main --test=happyPathTest,abortTest
+quintck spec.qnt --test          # no names = all runs in the module
+```
+
+### Common options
+
+| Option | Meaning |
+|---|---|
+| `--main=M` | main module (forwarded to `quint compile`) |
+| `--invariant=I1,I2` | invariants to check (default: `q::inv` when the spec was compiled with one) |
+| `--max-steps=N` | depth bound, default 10; `--exhaustive` removes it |
+| `--init=A --step=A` | non-default action names (e.g. qualified instances: `--init=naive::init --step=naive::step`) |
+| `--threads=N` | worker threads (default: all cores). Results are independent of the thread count |
+| `--max-states=N` | abort without a verdict after ~N states (safety valve) |
+| `--out-itf=PATH` | write the counterexample trace/lasso as [ITF](https://apalache-mc.org/docs/adr/015adr-trace.html) |
+| `--exact-states` | exact deduplication (full states) instead of 64-bit fingerprints |
+| `--test [T1,T2]` | execute `run` tests instead of model checking |
+
+Exit codes: `0` = all properties hold, `1` = violation found (output
+contains `[violation]` and the trace/lasso), `2` = tool error /
+unsupported feature.
+
+### Notes on semantics
+
+- **Fingerprint mode (default)**: the seen-set stores 64-bit state
+  fingerprints, like TLC. A hash collision would silently prune a state
+  with probability ~n²/2⁶⁵ — use `--exact-states` when you want exact
+  deduplication at a higher memory cost.
+- **Parallelism**: state counts, depths and verdicts are deterministic
+  and identical for every `--threads` value; when a parallel run finds a
+  violation, the trace is reproduced by a deterministic single-threaded
+  pass, so it is a shortest counterexample there too. Temporal checking,
+  run tests and `--exact-states` are single-threaded.
+- **Known limits**: `weakFair`/`strongFair` only as top-level premises;
+  integers are i64; `allLists`, `Int`/`Nat` enumeration and
+  `apalache::generate` are rejected. Unbounded random-walk `run` tests
+  (e.g. `20.reps(_ => step)`) can exceed the path-enumeration cap — use
+  the model checker for those.
 
 ## Workspace
 
