@@ -122,10 +122,15 @@ fn check_liveness(
         return Ok(None);
     };
     let lasso = witness::extract_lasso(&product, g, &fair_scc);
-    debug_assert!(
-        lasso_satisfies_negation(&prop.body, &lasso, g),
-        "extracted lasso does not satisfy the negated property (checker bug)"
-    );
+    if !lasso_satisfies_negation(&prop.body, &lasso, g) {
+        return Err(Box::new(CheckError {
+            error: crate::error::QuintError::new(
+                "QNT599",
+                "internal error: extracted lasso does not violate the temporal property",
+            ),
+            trace: lasso.states,
+        }));
+    }
     Ok(Some(lasso))
 }
 

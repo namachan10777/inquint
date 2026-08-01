@@ -1,0 +1,15 @@
+[package]
+name = "inquint-reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Independent closure-based reference evaluator for inquint verification"
+publish = false
+
+[dependencies]
+quint-ast = { path = "../quint-ast" }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

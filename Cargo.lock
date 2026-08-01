@@ -359,6 +359,7 @@ version = "0.1.0"
 dependencies = [
  "foldhash",
  "hashbrown 0.15.5",
+ "inquint-reference",
  "itf",
  "quint-ast",
  "rustc-hash",
@@ -375,6 +376,16 @@ dependencies = [
  "inquint",
  "quint-ast",
  "serde_json",
+]
+
+[[package]]
+name = "inquint-reference"
+version = "0.1.0"
+dependencies = [
+ "quint-ast",
+ "rustc-hash",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

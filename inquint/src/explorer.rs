@@ -52,6 +52,12 @@ pub enum CheckOutcome {
     Pass {
         states: u64,
         max_depth: u32,
+        /// The exact claim established by this successful search.
+        scope: SearchScope,
+        /// Exact-state exploration is the only mode for which inquint makes
+        /// a deterministic no-omission claim. Fingerprint exploration can
+        /// prune a distinct state on a 64-bit collision.
+        assurance: Assurance,
     },
     InvariantViolation {
         invariant: QuintName,
@@ -64,6 +70,39 @@ pub enum CheckOutcome {
     Incomplete {
         states: u64,
     },
+}
+
+/// Scope of a successful safety result. Keeping this in the public outcome
+/// prevents callers from accidentally presenting a depth-bounded search as
+/// a proof over the complete reachable state space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Exhaustive,
+    Bounded { max_steps: u32 },
+}
+
+/// State-deduplication guarantee attached to a successful result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Assurance {
+    Exact,
+    ProbabilisticFingerprint,
+}
+
+impl CheckConfig {
+    fn success_scope(&self) -> SearchScope {
+        match self.max_steps {
+            Some(max_steps) => SearchScope::Bounded { max_steps },
+            None => SearchScope::Exhaustive,
+        }
+    }
+
+    fn assurance(&self) -> Assurance {
+        if self.exact_states {
+            Assurance::Exact
+        } else {
+            Assurance::ProbabilisticFingerprint
+        }
+    }
 }
 
 pub struct CheckError {
@@ -83,7 +122,12 @@ pub fn check(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box
             // trace-reconstruction machinery.
             ParOutcome::Rerun => check_fp(spec, cfg),
             ParOutcome::Pass { states, max_depth } => {
-                Ok(CheckOutcome::Pass { states, max_depth })
+                Ok(CheckOutcome::Pass {
+                    states,
+                    max_depth,
+                    scope: cfg.success_scope(),
+                    assurance: cfg.assurance(),
+                })
             }
             ParOutcome::Incomplete { states } => Ok(CheckOutcome::Incomplete { states }),
         }
@@ -393,7 +437,10 @@ fn check_parallel(spec: &CompiledSpec, cfg: &CheckConfig) -> ParOutcome {
                 _ => return ParOutcome::Rerun,
             }
             frontier.extend_from_slice(&state);
-            discovered.fetch_add(1, Ordering::Relaxed);
+            let total = discovered.fetch_add(1, Ordering::Relaxed) + 1;
+            if cfg.max_states.is_some_and(|max| total >= max) {
+                return ParOutcome::Incomplete { states: total };
+            }
         }
     }
 
@@ -405,9 +452,9 @@ fn check_parallel(spec: &CompiledSpec, cfg: &CheckConfig) -> ParOutcome {
     let mut last_report = std::time::Instant::now();
 
     while !frontier.is_empty() {
-        if cfg.max_steps.is_some_and(|max| depth >= max) {
-            break;
-        }
+        // States at the depth bound must still be evaluated for deadlock.
+        // Their successors are deliberately not admitted to the search.
+        let at_bound = cfg.max_steps.is_some_and(|max| depth >= max);
         let n_states = frontier.len() / n_vars;
         let cursor = AtomicUsize::new(0);
         let frontier_ref = &frontier;
@@ -440,6 +487,9 @@ fn check_parallel(spec: &CompiledSpec, cfg: &CheckConfig) -> ParOutcome {
                                 if succs.is_empty() && cfg.deadlock {
                                     stop.store(true, Ordering::Relaxed);
                                     break 'chunks;
+                                }
+                                if at_bound {
+                                    continue;
                                 }
                                 let mut fresh = 0u64;
                                 for succ in succs {
@@ -485,6 +535,9 @@ fn check_parallel(spec: &CompiledSpec, cfg: &CheckConfig) -> ParOutcome {
         frontier.clear();
         for out in outs {
             frontier.extend_from_slice(&out);
+        }
+        if at_bound {
+            break;
         }
         if !frontier.is_empty() {
             depth += 1;
@@ -543,6 +596,14 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
             Err(e) => return Err(err_with(&parents, Some(idx), e)),
         }
         frontier.push(&state, 0);
+        if cfg
+            .max_states
+            .is_some_and(|max| parents.len() as u64 >= max)
+        {
+            return Ok(CheckOutcome::Incomplete {
+                states: parents.len() as u64,
+            });
+        }
     }
 
     let mut last_report = std::time::Instant::now();
@@ -551,10 +612,6 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
     while let Some((idx, depth)) = frontier.pop(&mut state_buf) {
         max_depth = max_depth.max(depth);
 
-        if cfg.max_steps.is_some_and(|max| depth >= max) {
-            continue;
-        }
-
         let successors = enumerate(&mut vm, spec.step, Some(&state_buf))
             .map_err(|e| err_with(&parents, Some(idx), e))?;
 
@@ -562,6 +619,10 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
             return Ok(CheckOutcome::Deadlock {
                 trace: reconstruct(spec, cfg, &parents, idx),
             });
+        }
+
+        if cfg.max_steps.is_some_and(|max| depth >= max) {
+            continue;
         }
 
         for succ in successors {
@@ -606,6 +667,8 @@ fn check_fp(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, Box<
     Ok(CheckOutcome::Pass {
         states: parents.len() as u64,
         max_depth,
+        scope: cfg.success_scope(),
+        assurance: cfg.assurance(),
     })
 }
 
@@ -718,6 +781,14 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
             Err(e) => return Err(err_with(&arena, Some(id), e)),
         }
         frontier.push_back(id);
+        if cfg
+            .max_states
+            .is_some_and(|max| arena.len() as u64 >= max)
+        {
+            return Ok(CheckOutcome::Incomplete {
+                states: arena.len() as u64,
+            });
+        }
     }
 
     let mut last_report = std::time::Instant::now();
@@ -726,10 +797,6 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
     while let Some(id) = frontier.pop_front() {
         let depth = arena.depth(id);
         max_depth = max_depth.max(depth);
-
-        if cfg.max_steps.is_some_and(|max| depth >= max) {
-            continue;
-        }
 
         state_buf.clear();
         state_buf.extend_from_slice(arena.get(id));
@@ -741,6 +808,10 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
             return Ok(CheckOutcome::Deadlock {
                 trace: arena.trace(id),
             });
+        }
+
+        if cfg.max_steps.is_some_and(|max| depth >= max) {
+            continue;
         }
 
         for succ in successors {
@@ -784,5 +855,7 @@ fn check_exact(spec: &CompiledSpec, cfg: &CheckConfig) -> Result<CheckOutcome, B
     Ok(CheckOutcome::Pass {
         states: arena.len() as u64,
         max_depth,
+        scope: cfg.success_scope(),
+        assurance: cfg.assurance(),
     })
 }

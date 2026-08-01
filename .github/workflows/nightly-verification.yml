@@ -1,0 +1,51 @@
+name: nightly verification
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  corpus-and-oracles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release
+      - run: bash scripts/inquint-check.sh
+
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v0.67
+        with:
+          args: --package inquint --output-format=terse
+
+  tlc-differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: quint/quint/package-lock.json
+      - name: Build the pinned Quint submodule
+        working-directory: quint/quint
+        run: npm ci && npm run prepare
+      - name: Put pinned Quint on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          ln -s "$GITHUB_WORKSPACE/quint/quint/dist/src/cli.js" "$RUNNER_TEMP/bin/quint"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/temporal-diff.sh

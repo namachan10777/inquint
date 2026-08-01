@@ -248,6 +248,68 @@ mod tests {
         Ltl::SAtom(i)
     }
 
+    struct Word<'a> {
+        path: &'a [usize],
+        loop_index: usize,
+        atom_true: &'a [bool],
+    }
+
+    impl super::super::validate::LassoAtoms for Word<'_> {
+        fn n(&self) -> usize {
+            self.path.len()
+        }
+        fn loop_index(&self) -> usize {
+            self.loop_index
+        }
+        fn state_atom(&self, _atom: u32, pos: usize) -> bool {
+            self.atom_true[self.path[pos]]
+        }
+        fn edge_atom(&self, _atom: u32, _pos: usize) -> bool {
+            false
+        }
+    }
+
+    fn formula_holds_on_some_lasso(
+        formula: &Ltl,
+        atom_true: &[bool],
+        edges: &[(usize, usize)],
+    ) -> bool {
+        fn visit(
+            formula: &Ltl,
+            atom_true: &[bool],
+            edges: &[(usize, usize)],
+            path: &mut Vec<usize>,
+            max_len: usize,
+        ) -> bool {
+            let last = *path.last().unwrap();
+            for loop_index in 0..path.len() {
+                if edges.contains(&(last, path[loop_index])) {
+                    let word = Word {
+                        path,
+                        loop_index,
+                        atom_true,
+                    };
+                    if super::super::validate::holds(formula, &word) {
+                        return true;
+                    }
+                }
+            }
+            if path.len() == max_len {
+                return false;
+            }
+            for &(_, next) in edges.iter().filter(|(source, _)| *source == last) {
+                path.push(next);
+                if visit(formula, atom_true, edges, path, max_len) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+
+        visit(formula, atom_true, edges, &mut vec![0], 6)
+    }
+
     /// Explicitly check a tiny Kripke structure against the GBA by brute
     /// force: states 0..n with given edges and one boolean atom valuation;
     /// search for an accepting lasso in the product.
@@ -391,5 +453,46 @@ mod tests {
         ])));
         let neg = build_gba(&nnf(&leads, true));
         assert!(!gba_accepts_some_lasso(&neg, &[true], &[(0, 0)]));
+    }
+
+    /// Exhaustive two-state differential check: direct LTL-on-lasso
+    /// semantics and the generated GBA agree for every total graph and
+    /// valuation of one state atom.
+    #[test]
+    fn gba_matches_direct_lasso_semantics_on_all_two_state_graphs() {
+        let p = sa(0);
+        let formulas = vec![
+            p.clone(),
+            Ltl::Not(Box::new(p.clone())),
+            Ltl::Eventually(Box::new(p.clone())),
+            Ltl::Always(Box::new(p.clone())),
+            Ltl::Always(Box::new(Ltl::Eventually(Box::new(p.clone())))),
+            Ltl::Eventually(Box::new(Ltl::Always(Box::new(p.clone())))),
+            Ltl::Always(Box::new(Ltl::Or(vec![
+                Ltl::Not(Box::new(p.clone())),
+                Ltl::Eventually(Box::new(p)),
+            ]))),
+        ];
+        for mask in 0u8..16 {
+            let edges: Vec<(usize, usize)> = (0..2)
+                .flat_map(|s| (0..2).map(move |t| (s, t)))
+                .filter(|(s, t)| mask & (1 << (s * 2 + t)) != 0)
+                .collect();
+            if (0..2).any(|s| !edges.iter().any(|(source, _)| *source == s)) {
+                continue;
+            }
+            for valuation in 0u8..4 {
+                let atoms = [valuation & 1 != 0, valuation & 2 != 0];
+                for formula in &formulas {
+                    let direct = formula_holds_on_some_lasso(formula, &atoms, &edges);
+                    let gba = build_gba(&nnf(formula, false));
+                    let automaton = gba_accepts_some_lasso(&gba, &atoms, &edges);
+                    assert_eq!(
+                        automaton, direct,
+                        "mask={mask:#x}, valuation={valuation:#x}, formula={formula}"
+                    );
+                }
+            }
+        }
     }
 }

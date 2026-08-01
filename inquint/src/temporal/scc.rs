@@ -196,10 +196,7 @@ fn check_scc(
             // WF without a taken edge: the cycle must visit a state where
             // ⟨A⟩_v is disabled. If none exists, no sub-SCC can help
             // either (both disjuncts are monotone in the node/edge set).
-            match disabled_node(f) {
-                Some(n) => node_witnesses.push(n),
-                None => return None,
-            }
+            node_witnesses.push(disabled_node(f)?);
         } else {
             // SF without a taken edge: the cycle must avoid every state
             // where ⟨A⟩_v is enabled.
@@ -242,4 +239,61 @@ fn check_scc(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reachable(mask: u32, n: usize, source: usize, target: usize) -> bool {
+        let mut seen = 1u32 << source;
+        loop {
+            let before = seen;
+            for s in 0..n {
+                if seen & (1 << s) == 0 {
+                    continue;
+                }
+                for t in 0..n {
+                    if mask & (1 << (s * n + t)) != 0 {
+                        seen |= 1 << t;
+                    }
+                }
+            }
+            if seen == before {
+                return seen & (1 << target) != 0;
+            }
+        }
+    }
+
+    /// Exhaustively compare Tarjan with the definition of SCC on every
+    /// directed graph up to four nodes (65,536 four-node graphs).
+    #[test]
+    fn tarjan_matches_mutual_reachability_on_all_small_graphs() {
+        for n in 1..=4usize {
+            for mask in 0..(1u32 << (n * n)) {
+                let nodes: Vec<u32> = (0..n as u32).collect();
+                let adj: FxHashMap<u32, Vec<(u32, u32)>> = nodes
+                    .iter()
+                    .map(|&s| {
+                        let edges = (0..n as u32)
+                            .filter(|&t| mask & (1 << (s as usize * n + t as usize)) != 0)
+                            .map(|t| (t, 0))
+                            .collect();
+                        (s, edges)
+                    })
+                    .collect();
+                let components = tarjan(&adj, &nodes);
+                assert_eq!(components.iter().map(Vec::len).sum::<usize>(), n);
+                for a in 0..n {
+                    for b in 0..n {
+                        let same = components
+                            .iter()
+                            .any(|c| c.contains(&(a as u32)) && c.contains(&(b as u32)));
+                        let oracle = reachable(mask, n, a, b) && reachable(mask, n, b, a);
+                        assert_eq!(same, oracle, "n={n}, mask={mask:#x}, a={a}, b={b}");
+                    }
+                }
+            }
+        }
+    }
 }

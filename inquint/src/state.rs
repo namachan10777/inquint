@@ -184,3 +184,33 @@ impl VarTable {
 
 pub type Register = Rc<Cell<Option<Value>>>;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exhaustively insert all 25 two-variable states over -2..=2 twice.
+    /// No two structural states may alias and every duplicate must resolve
+    /// to its original id.
+    #[test]
+    fn exact_seen_set_distinguishes_all_small_states() {
+        let mut arena = StateArena::new(2);
+        let mut seen = SeenSet::default();
+        let mut expected = Vec::new();
+        for a in -2..=2 {
+            for b in -2..=2 {
+                let state = [Value::int(a), Value::int(b)];
+                let (id, fresh) = seen.insert_or_get(&mut arena, &state, None, 0);
+                assert!(fresh);
+                assert_eq!(arena.get(id), state);
+                expected.push((state, id));
+            }
+        }
+        assert_eq!(arena.len(), 25);
+        for (state, expected_id) in expected {
+            let (id, fresh) = seen.insert_or_get(&mut arena, &state, None, 0);
+            assert!(!fresh);
+            assert_eq!(id, expected_id);
+        }
+        assert_eq!(arena.len(), 25);
+    }
+}

@@ -1,7 +1,9 @@
 //! Correctness gate: check the specs corpus fixtures and assert exact
 //! outcomes, including counterexample depths and successor counts.
 
-use inquint::explorer::{check, CheckConfig, CheckOutcome};
+use inquint::explorer::{
+    check, Assurance, CheckConfig, CheckOutcome, SearchScope,
+};
 use inquint::spec::{CompiledSpec, EntryPoints};
 use inquint::successor::enumerate;
 use std::path::PathBuf;
@@ -44,7 +46,12 @@ fn cfg_exact(max_steps: Option<u32>) -> CheckConfig {
 fn exact_mode_agrees() {
     let spec = build("TeachingConcurrency.json", &["correctness"]);
     match check(&spec, &cfg_exact(None)).map_err(|e| e.error).unwrap() {
-        CheckOutcome::Pass { states, .. } => assert_eq!(states, 439),
+        CheckOutcome::Pass {
+            states,
+            scope: SearchScope::Exhaustive,
+            assurance: Assurance::Exact,
+            ..
+        } => assert_eq!(states, 439),
         _ => panic!("expected pass"),
     }
     let broken = build("TwoPhaseCommit.json", &["brokenNoAbort"]);
@@ -60,7 +67,21 @@ fn exact_mode_agrees() {
 #[track_caller]
 fn expect_pass(spec: &CompiledSpec, max_steps: Option<u32>) -> u64 {
     match check(spec, &cfg(max_steps)).map_err(|e| e.error).unwrap() {
-        CheckOutcome::Pass { states, .. } => states,
+        CheckOutcome::Pass {
+            states,
+            scope,
+            assurance,
+            ..
+        } => {
+            assert_eq!(
+                scope,
+                max_steps.map_or(SearchScope::Exhaustive, |max_steps| {
+                    SearchScope::Bounded { max_steps }
+                })
+            );
+            assert_eq!(assurance, Assurance::ProbabilisticFingerprint);
+            states
+        }
         CheckOutcome::InvariantViolation { invariant, trace } => {
             panic!("unexpected violation of {invariant} at depth {}", trace.len() - 1)
         }
@@ -100,6 +121,24 @@ fn teaching_concurrency_successor_counts() {
     let successors = enumerate(&mut vm, spec.step, Some(some_init)).unwrap();
     // 3 processes can each take a step; results are distinct states
     assert_eq!(successors.len(), 3);
+}
+
+#[test]
+fn state_limit_during_initialization_never_returns_pass() {
+    let spec = build("TeachingConcurrency.json", &["correctness"]);
+    for (exact_states, threads) in [(true, 1), (false, 1), (false, 4)] {
+        let config = CheckConfig {
+            max_steps: Some(0),
+            deadlock: false,
+            max_states: Some(1),
+            exact_states,
+            threads,
+        };
+        match check(&spec, &config).map_err(|e| e.error).unwrap() {
+            CheckOutcome::Incomplete { states } => assert!(states >= 1),
+            _ => panic!("state limit must not produce a successful verdict"),
+        }
+    }
 }
 
 /// Determinism: two enumerations of the same state are identical.
@@ -177,6 +216,35 @@ fn dining_philosophers_naive_deadlocks() {
     }
 }
 
+/// A deadlock is a property of a state at the bound, so that state must be
+/// expanded far enough to establish that it has no successors. This guards
+/// against reporting a false bounded success at exactly the deadlock depth.
+#[test]
+fn deadlock_at_depth_bound_is_not_missed() {
+    let out = load("DiningPhilosophers_naive.json");
+    let spec = CompiledSpec::build(&out, &EntryPoints::default()).unwrap();
+    let bounded = |max_steps| CheckConfig {
+        max_steps: Some(max_steps),
+        deadlock: true,
+        max_states: None,
+        exact_states: true,
+        threads: 1,
+    };
+
+    match check(&spec, &bounded(5)).map_err(|e| e.error).unwrap() {
+        CheckOutcome::Pass {
+            scope: inquint::explorer::SearchScope::Bounded { max_steps: 5 },
+            assurance: inquint::explorer::Assurance::Exact,
+            ..
+        } => {}
+        _ => panic!("expected no deadlock through depth 5"),
+    }
+    match check(&spec, &bounded(6)).map_err(|e| e.error).unwrap() {
+        CheckOutcome::Deadlock { trace } => assert_eq!(trace.len() - 1, 6),
+        _ => panic!("expected deadlock at the depth bound"),
+    }
+}
+
 #[test]
 fn reliable_broadcast() {
     let spec = build(
@@ -248,7 +316,7 @@ fn parallel_agrees_with_sequential() {
             ..cfg(Some(6))
         };
         let unpack = |r: Result<inquint::explorer::CheckOutcome, Box<inquint::explorer::CheckError>>, mode: &str| match r {
-            Ok(inquint::explorer::CheckOutcome::Pass { states, max_depth }) => (states, max_depth),
+            Ok(inquint::explorer::CheckOutcome::Pass { states, max_depth, .. }) => (states, max_depth),
             Ok(inquint::explorer::CheckOutcome::InvariantViolation { .. }) => {
                 panic!("{fixture} ({mode}): unexpected violation")
             }

@@ -14,3 +14,9 @@ hashbrown = { workspace = true }
 foldhash = { workspace = true }
 thiserror = { workspace = true }
 itf = { workspace = true }
+
+[dev-dependencies]
+inquint-reference = { path = "../inquint-reference" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

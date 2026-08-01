@@ -139,6 +139,14 @@ pub fn build(
         enumerate(&mut vm, spec.init, None).map_err(|e| fail(&g, None, e))?;
     for state in initial {
         intern!(g, &state, None, 0)?;
+        if cfg
+            .max_states
+            .is_some_and(|max| g.arena.len() as u64 >= max)
+        {
+            return Ok(GraphOutcome::Incomplete {
+                states: g.arena.len() as u64,
+            });
+        }
     }
     g.init_count = g.arena.len() as u32;
 

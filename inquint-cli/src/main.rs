@@ -1,5 +1,5 @@
 use clap::Parser;
-use inquint::explorer::{check, CheckConfig, CheckOutcome};
+use inquint::explorer::{check, Assurance, CheckConfig, CheckOutcome, SearchScope};
 use inquint::spec::{CompiledSpec, EntryPoints};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -212,7 +212,10 @@ fn main() -> ExitCode {
         };
         return match check_temporal(&spec, &tcfg) {
             Ok(TemporalOutcome::Pass { states }) => {
-                println!("[ok] {states} states explored, temporal properties hold");
+                println!(
+                    "[ok:assured-exact] {states} states explored exhaustively; \
+                     temporal properties hold"
+                );
                 ExitCode::SUCCESS
             }
             Ok(TemporalOutcome::SafetyViolation { property, trace }) => {
@@ -283,8 +286,25 @@ fn main() -> ExitCode {
     }
 
     match check(&spec, &cfg) {
-        Ok(CheckOutcome::Pass { states, max_depth }) => {
-            println!("[ok] {states} states explored, depth <= {max_depth}, invariants hold");
+        Ok(CheckOutcome::Pass {
+            states,
+            max_depth,
+            scope,
+            assurance,
+        }) => {
+            let assurance = match assurance {
+                Assurance::Exact => "assured-exact",
+                Assurance::ProbabilisticFingerprint => "non-assured:fingerprint",
+            };
+            match scope {
+                SearchScope::Exhaustive => println!(
+                    "[ok:{assurance}] {states} states explored exhaustively; invariants hold"
+                ),
+                SearchScope::Bounded { max_steps } => println!(
+                    "[ok:{assurance}] {states} states explored; no violation through depth \
+                     {max_steps} (deepest reached: {max_depth})"
+                ),
+            }
             ExitCode::SUCCESS
         }
         Ok(CheckOutcome::InvariantViolation { invariant, trace }) => {
